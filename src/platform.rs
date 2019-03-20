@@ -19,9 +19,79 @@ use memory::*;
 use std;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::io;
 use win_hv_platform::*;
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
+
+use vmm_vcpu::vcpu::{Vcpu, Fpu, MsrEntries, SpecialRegisters, VmmRegisters,
+                     SegmentRegister, SegmentDescriptor, VcpuExit, LApicState};
+use vmm_vcpu::vcpu::Result as VcpuResult;
+
+trait ConvertSegmentRegister {
+    fn to_portable(&self) -> SegmentRegister;
+    fn from_portable(from: &SegmentRegister) -> Self;
+}
+
+impl ConvertSegmentRegister for WHV_X64_SEGMENT_REGISTER {
+    fn to_portable(&self) -> SegmentRegister {
+        SegmentRegister {
+            base: self.Base,
+            limit: self.Limit,
+            selector: self.Selector,
+            type_: self.SegmentType() as u8,
+            present: self.Present() as u8,
+            dpl: self.DescriptorPrivilegeLevel() as u8,
+            db: self.Default() as u8,
+            s: !self.NonSystemSegment() as u8,
+            l: self.Long() as u8,
+            g: self.Granularity() as u8,
+            avl: self.Available() as u8,
+            unusable: 0,
+            padding: 0,
+        }
+    }
+
+    fn from_portable(from: &SegmentRegister) -> WHV_X64_SEGMENT_REGISTER {
+        let mut segment = WHV_X64_SEGMENT_REGISTER {
+            Base: from.base,
+            Limit: from.limit,
+            Selector: from.selector,
+            Attributes: 0,
+        };
+
+        segment.set_SegmentType(from.type_ as u16);
+        segment.set_NonSystemSegment(!from.s as u16);
+        segment.set_Present(from.present as u16);
+        segment.set_Long(from.l as u16);
+        segment.set_Granularity(from.g as u16);
+
+        segment
+    }
+}
+
+trait ConvertSegmentDescriptor {
+    fn to_portable(&self) -> SegmentDescriptor;
+    fn from_portable(from: &SegmentDescriptor) -> Self;
+}
+
+impl ConvertSegmentDescriptor for WHV_X64_TABLE_REGISTER {
+    fn to_portable(&self) -> SegmentDescriptor {
+        SegmentDescriptor {
+            base: self.Base,
+            limit: self.Limit,
+            padding: self.Pad,
+        }
+    }
+
+    fn from_portable(from: &SegmentDescriptor) -> WHV_X64_TABLE_REGISTER {
+        WHV_X64_TABLE_REGISTER {
+            Base: from.base,
+            Limit: from.limit,
+            Pad: from.padding,
+        }
+    }
+}
 
 pub fn get_capability(capability_code: WHV_CAPABILITY_CODE) -> Result<WHV_CAPABILITY, WHPError> {
     let mut capability: WHV_CAPABILITY = Default::default();
@@ -38,7 +108,7 @@ pub fn get_capability(capability_code: WHV_CAPABILITY_CODE) -> Result<WHV_CAPABI
     Ok(capability)
 }
 
-struct PartitionHandle {
+pub struct PartitionHandle {
     handle: WHV_PARTITION_HANDLE,
 }
 
@@ -166,6 +236,18 @@ impl Partition {
         })
     }
 
+    pub fn create_vcpu(&self, index: UINT32) -> Result<WhpVcpu, WHPError> {
+        check_result(unsafe {
+            WHvCreateVirtualProcessor(*self.partition.borrow_mut().handle(), index, 0)
+        })?;
+        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
+        Ok(WhpVcpu {
+            partition: Rc::clone(&self.partition),
+            index: index,
+            exit_context: exit_context,
+        })
+    }
+
     pub fn map_gpa_range<T: Memory>(
         &mut self,
         source_address: &T,
@@ -223,6 +305,393 @@ impl Drop for GPARangeMapping {
         let p = self.partition.borrow_mut();
         check_result(unsafe { WHvUnmapGpaRange(*p.handle(), self.guest_address, self.size) })
             .unwrap();
+    }
+}
+
+pub struct WhpVcpu {
+    partition: Rc<RefCell<PartitionHandle>>,
+    index: UINT32,
+    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
+}
+
+impl Drop for WhpVcpu{
+    fn drop(&mut self) {
+        check_result(unsafe {
+            WHvDeleteVirtualProcessor(*self.partition.borrow_mut().handle(), self.index)
+        })
+        .unwrap();
+    }
+}
+
+impl WhpVcpu {
+    fn index(&self) -> UINT32 {
+        return self.index;
+    }
+
+    pub fn do_run(&self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
+        let mut exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
+        let exit_context_size = std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as UINT32;
+
+        check_result(unsafe {
+            WHvRunVirtualProcessor(
+                *self.partition.borrow_mut().handle(),
+                self.index,
+                &mut exit_context as *mut _ as *mut VOID,
+                exit_context_size,
+            )
+        })?;
+        Ok(exit_context)
+    }
+
+    pub fn set_registers(
+        &self,
+        reg_names: &[WHV_REGISTER_NAME],
+        reg_values: &[WHV_REGISTER_VALUE],
+    ) -> Result<(), WHPError> {
+        let num_regs = reg_names.len();
+
+        if num_regs != reg_values.len() {
+            panic!("reg_names and reg_values must have the same length")
+        }
+
+        check_result(unsafe {
+            WHvSetVirtualProcessorRegisters(
+                *self.partition.borrow_mut().handle(),
+                self.index,
+                reg_names.as_ptr(),
+                num_regs as UINT32,
+                reg_values.as_ptr(),
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn get_registers(
+        &self,
+        reg_names: &[WHV_REGISTER_NAME],
+        reg_values: &mut [WHV_REGISTER_VALUE],
+    ) -> Result<(), WHPError> {
+        let num_regs = reg_names.len();
+
+        if num_regs != reg_values.len() {
+            panic!("reg_names and reg_values must have the same length")
+        }
+
+        check_result(unsafe {
+            WHvGetVirtualProcessorRegisters(
+                *self.partition.borrow().handle(),
+                self.index,
+                reg_names.as_ptr(),
+                num_regs as UINT32,
+                reg_values.as_mut_ptr(),
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn set_lapic_state(&self, state: &LApicState) -> Result<(), WHPError> {
+        check_result(unsafe {
+            WHvSetVirtualProcessorInterruptControllerState(
+                *self.partition.borrow().handle(),
+                self.index,
+                state as *const _ as *const VOID,
+                std::mem::size_of::<LapicStateRaw>() as UINT32,
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn get_lapic_state(&self) -> Result<LApicState, WHPError> {
+        let mut state: LApicState = Default::default();
+        let mut written_size: UINT32 = 0;
+
+        check_result(unsafe {
+            WHvGetVirtualProcessorInterruptControllerState(
+                *self.partition.borrow().handle(),
+                self.index,
+                &mut state as *mut _ as *mut VOID,
+                std::mem::size_of::<LapicStateRaw>() as UINT32,
+                &mut written_size,
+            )
+        })?;
+        Ok(state)
+    }
+}
+
+impl Vcpu for WhpVcpu {
+
+    type RunContextType = WHV_RUN_VP_EXIT_CONTEXT;
+
+    fn get_run_context(&self) -> WHV_RUN_VP_EXIT_CONTEXT {
+        return self.exit_context;
+    }
+
+    fn set_fpu(&self, fpu: &Fpu) -> Result<(), io::Error> {
+        let reg_names: [WHV_REGISTER_NAME; 4] = [
+            WHV_REGISTER_NAME::WHvX64RegisterFpControlStatus,
+            WHV_REGISTER_NAME::WHvX64RegisterXmmControlStatus,
+            WHV_REGISTER_NAME::WHvX64RegisterXmm0,
+            WHV_REGISTER_NAME::WHvX64RegisterFpMmx0,
+        ];
+
+        let mut reg_values: [WHV_REGISTER_VALUE; 4] = Default::default();
+        reg_values[0].Reg64 = fpu.fcw as UINT64;
+        reg_values[1].Reg64 = fpu.mxcsr as UINT64;
+        reg_values[2].Fp = WHV_X64_FP_REGISTER {
+            AsUINT128: WHV_UINT128 {
+                Low64: 0,
+                High64: 0,
+            },
+        };
+        reg_values[3].Fp = WHV_X64_FP_REGISTER {
+            AsUINT128: WHV_UINT128 {
+                Low64: 0,
+                High64: 0,
+            },
+        };
+        println!("In WHP set_fpu");
+
+        self.set_registers(&reg_names, &reg_values)
+            .map_err(|_| io::Error::last_os_error());
+        Ok(())
+    }
+
+    fn set_msrs(&self, _msrs: &MsrEntries) -> VcpuResult<()> {
+        // Need to create a mapping between arch_gen indices of MSRs and the
+        // MSRs that WHV exposes. Each mapping will consist of a tuple of
+        // the MSR index and the WHV register name. Non-supported MSRs should
+        // be empty/identifiabler
+
+        let sregs: SpecialRegisters = Default::default();
+        self.set_sregs(&sregs);
+        println!("In WHP set_msrs");
+        Ok(())
+    }
+
+    fn get_regs(&self) -> Result<VmmRegisters, io::Error> {
+        let reg_names: [WHV_REGISTER_NAME; 18] = [
+            WHV_REGISTER_NAME::WHvX64RegisterRax,    // 0
+            WHV_REGISTER_NAME::WHvX64RegisterRbx,    // 1
+            WHV_REGISTER_NAME::WHvX64RegisterRcx,    // 2
+            WHV_REGISTER_NAME::WHvX64RegisterRdx,    // 3
+            WHV_REGISTER_NAME::WHvX64RegisterRsi,    // 4
+            WHV_REGISTER_NAME::WHvX64RegisterRdi,    // 5
+            WHV_REGISTER_NAME::WHvX64RegisterRsp,    // 6
+            WHV_REGISTER_NAME::WHvX64RegisterRbp,    // 7
+            WHV_REGISTER_NAME::WHvX64RegisterR8,     // 8
+            WHV_REGISTER_NAME::WHvX64RegisterR9,     // 9
+            WHV_REGISTER_NAME::WHvX64RegisterR10,    // 10
+            WHV_REGISTER_NAME::WHvX64RegisterR11,    // 11
+            WHV_REGISTER_NAME::WHvX64RegisterR12,    // 12
+            WHV_REGISTER_NAME::WHvX64RegisterR13,    // 13
+            WHV_REGISTER_NAME::WHvX64RegisterR14,    // 14
+            WHV_REGISTER_NAME::WHvX64RegisterR15,    // 15
+            WHV_REGISTER_NAME::WHvX64RegisterRip,    // 16
+            WHV_REGISTER_NAME::WHvX64RegisterRflags, // 17  ??
+        ];
+        let mut reg_values: [WHV_REGISTER_VALUE; 18] = Default::default();
+
+        self.get_registers(&reg_names, &mut reg_values)
+            .map_err(|_| io::Error::last_os_error())?;
+
+        unsafe {
+            Ok(VmmRegisters {
+                rax: reg_values[0].Reg64,
+                rbx: reg_values[1].Reg64,
+                rcx: reg_values[2].Reg64,
+                rdx: reg_values[3].Reg64,
+                rsi: reg_values[4].Reg64,
+                rdi: reg_values[5].Reg64,
+                rsp: reg_values[6].Reg64,
+                rbp: reg_values[7].Reg64,
+                r8: reg_values[8].Reg64,
+                r9: reg_values[9].Reg64,
+                r10: reg_values[10].Reg64,
+                r11: reg_values[11].Reg64,
+                r12: reg_values[12].Reg64,
+                r13: reg_values[13].Reg64,
+                r14: reg_values[14].Reg64,
+                r15: reg_values[15].Reg64,
+                rip: reg_values[16].Reg64,
+                rflags: reg_values[17].Reg64,
+            })
+        }
+    }
+
+    fn set_regs(&self, regs: &VmmRegisters) -> Result<(), io::Error> {
+        let reg_names: [WHV_REGISTER_NAME; 18] = [
+            WHV_REGISTER_NAME::WHvX64RegisterRax,    // 0 rax
+            WHV_REGISTER_NAME::WHvX64RegisterRbx,    // 1
+            WHV_REGISTER_NAME::WHvX64RegisterRcx,    // 2
+            WHV_REGISTER_NAME::WHvX64RegisterRdx,    // 3
+            WHV_REGISTER_NAME::WHvX64RegisterRsi,    // 4
+            WHV_REGISTER_NAME::WHvX64RegisterRdi,    // 5
+            WHV_REGISTER_NAME::WHvX64RegisterRsp,    // 6
+            WHV_REGISTER_NAME::WHvX64RegisterRbp,    // 7  ??
+            WHV_REGISTER_NAME::WHvX64RegisterR8,     // 8  ??
+            WHV_REGISTER_NAME::WHvX64RegisterR9,     // 9  ??
+            WHV_REGISTER_NAME::WHvX64RegisterR10,    // 10
+            WHV_REGISTER_NAME::WHvX64RegisterR11,    // 11
+            WHV_REGISTER_NAME::WHvX64RegisterR12,    // 12
+            WHV_REGISTER_NAME::WHvX64RegisterR13,    // 13
+            WHV_REGISTER_NAME::WHvX64RegisterR14,    // 14
+            WHV_REGISTER_NAME::WHvX64RegisterR15,    // 15
+            WHV_REGISTER_NAME::WHvX64RegisterRip,    // 16
+            WHV_REGISTER_NAME::WHvX64RegisterRflags, // 17  ??
+        ];
+        let reg_values: [WHV_REGISTER_VALUE; 18] = [
+            WHV_REGISTER_VALUE { Reg64: regs.rax },    // 0: Rax
+            WHV_REGISTER_VALUE { Reg64: regs.rbx },    // 1: Rbx
+            WHV_REGISTER_VALUE { Reg64: regs.rcx },    // 2: Rcx
+            WHV_REGISTER_VALUE { Reg64: regs.rdx },    // 3: Rdx
+            WHV_REGISTER_VALUE { Reg64: regs.rsi },    // 4: Rsi
+            WHV_REGISTER_VALUE { Reg64: regs.rdi },    // 5: Rdi
+            WHV_REGISTER_VALUE { Reg64: regs.rsp },    // 6: Rsp
+            WHV_REGISTER_VALUE { Reg64: regs.rbp },    // 7: Rbp
+            WHV_REGISTER_VALUE { Reg64: regs.r8 },     // 8: R8
+            WHV_REGISTER_VALUE { Reg64: regs.r9 },     // 9: R9
+            WHV_REGISTER_VALUE { Reg64: regs.r10 },    // 10: R10
+            WHV_REGISTER_VALUE { Reg64: regs.r11 },    // 11: R11
+            WHV_REGISTER_VALUE { Reg64: regs.r12 },    // 12: R12
+            WHV_REGISTER_VALUE { Reg64: regs.r13 },    // 13: R13
+            WHV_REGISTER_VALUE { Reg64: regs.r14 },    // 14: R14
+            WHV_REGISTER_VALUE { Reg64: regs.r15 },    // 15: R15
+            WHV_REGISTER_VALUE { Reg64: regs.rip },    // 16: Rip
+            WHV_REGISTER_VALUE { Reg64: regs.rflags }, // 17: Rflags
+        ];
+
+        self.set_registers(&reg_names, &reg_values)
+            .map_err(|_| io::Error::last_os_error())?;
+
+        Ok(())
+    }
+
+    fn set_sregs(&self, sregs: &SpecialRegisters) -> Result<(), io::Error> {
+        let reg_names: [WHV_REGISTER_NAME; 17] = [
+            WHV_REGISTER_NAME::WHvX64RegisterCs,   // 0
+            WHV_REGISTER_NAME::WHvX64RegisterDs,   // 1
+            WHV_REGISTER_NAME::WHvX64RegisterEs,   // 2
+            WHV_REGISTER_NAME::WHvX64RegisterFs,   // 3
+            WHV_REGISTER_NAME::WHvX64RegisterGs,   // 4
+            WHV_REGISTER_NAME::WHvX64RegisterSs,   // 5
+            WHV_REGISTER_NAME::WHvX64RegisterTr,   // 6
+            WHV_REGISTER_NAME::WHvX64RegisterLdtr, // 7
+            WHV_REGISTER_NAME::WHvX64RegisterGdtr, // 8
+            WHV_REGISTER_NAME::WHvX64RegisterIdtr, // 9
+            WHV_REGISTER_NAME::WHvX64RegisterCr0,  // 10
+            WHV_REGISTER_NAME::WHvX64RegisterCr2,  // 11
+            WHV_REGISTER_NAME::WHvX64RegisterCr3,  // 12
+            WHV_REGISTER_NAME::WHvX64RegisterCr4,  // 13
+            WHV_REGISTER_NAME::WHvX64RegisterCr8,  // 14
+            WHV_REGISTER_NAME::WHvX64RegisterEfer, // 15
+            WHV_REGISTER_NAME::WHvX64RegisterApicBase, // 16
+                                                   //            WHV_REGISTER_NAME::WHvRegisterPendingInterruption, // 17
+        ];
+        let reg_values: [WHV_REGISTER_VALUE; 17] = [
+            WHV_REGISTER_VALUE {
+                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.cs),
+            }, // 0: Cs
+            WHV_REGISTER_VALUE {
+                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.ds),
+            }, // 1: Ds
+            WHV_REGISTER_VALUE {
+                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.es),
+            }, // 2: Es
+            WHV_REGISTER_VALUE {
+                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.fs),
+            }, // 3: Fs
+            WHV_REGISTER_VALUE {
+                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.gs),
+            }, // 4: Gs
+            WHV_REGISTER_VALUE {
+                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.ss),
+            }, // 5: Ss
+            WHV_REGISTER_VALUE {
+                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.tr),
+            }, // 6: Tr
+            WHV_REGISTER_VALUE {
+                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.ldt),
+            }, // 7: Ldtr
+            WHV_REGISTER_VALUE {
+                Table: WHV_X64_TABLE_REGISTER::from_portable(&sregs.gdt),
+            }, // 8: Gdtr
+            WHV_REGISTER_VALUE {
+                Table: WHV_X64_TABLE_REGISTER::from_portable(&sregs.idt),
+            }, // 9: Idtr
+            WHV_REGISTER_VALUE { Reg64: sregs.cr0 }, // 10: Cr0
+            WHV_REGISTER_VALUE { Reg64: sregs.cr2 }, // 11: Cr2
+            WHV_REGISTER_VALUE { Reg64: sregs.cr3 }, // 12: Cr3
+            WHV_REGISTER_VALUE { Reg64: sregs.cr4 }, // 13: Cr4
+            WHV_REGISTER_VALUE { Reg64: sregs.cr8 }, // 14: Cr8
+            WHV_REGISTER_VALUE { Reg64: sregs.efer }, // 15: Efer
+            WHV_REGISTER_VALUE {
+                Reg64: sregs.apic_base,
+            }, // 16: ApicBase
+                                                     //            WHV_REGISTER_VALUE { Reg64: Default::default() }, // 17: PendingInterruption
+        ];
+
+        self.set_registers(&reg_names, &reg_values)
+            .map_err(|_| io::Error::last_os_error())?;
+
+        Ok(())
+    }
+
+    fn run(&self) -> Result<VcpuExit, io::Error> {
+        let exit_context_size = std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as UINT32;
+
+        /*
+        let result = unsafe {
+            WHvRunVirtualProcessor(
+                *self.partition.borrow_mut().handle(),
+                self.index,
+                &mut exit_context as *mut _ as *mut VOID,
+                exit_context_size,
+            )
+        };
+        */
+        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = self.do_run().unwrap();
+
+        let exit_reason = 
+            match exit_context.ExitReason {
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::Unknown,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => VcpuExit::MemoryAccess,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => VcpuExit::IoPortAccess,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnrecoverableException => {
+                    VcpuExit::UnrecoverableException
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonInvalidVpRegisterValue => {
+                    VcpuExit::InvalidVpRegisterValue
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnsupportedFeature => {
+                    VcpuExit::UnsupportedFeature
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64InterruptWindow => {
+                    VcpuExit::InterruptWindow
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => VcpuExit::Hlt,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => VcpuExit::IoapicEoi,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => VcpuExit::MsrAccess,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => VcpuExit::Cpuid,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonException => VcpuExit::Exception,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonCanceled => VcpuExit::Canceled,
+            };
+
+        Ok(exit_reason)
+    }
+
+    fn get_lapic(&self) -> Result<LApicState, io::Error> {
+
+        let state:LApicState = self.get_lapic_state()
+            .map_err(|_| io::Error::last_os_error())?;
+
+        Ok(state)
+    }
+
+    fn set_lapic(&self, klapic: &LApicState) -> Result<(), io::Error> {
+        self.set_lapic_state(klapic)
+            .map_err(|_| io::Error::last_os_error())?;
+
+        Ok(())
     }
 }
 
@@ -491,6 +960,7 @@ impl Drop for VirtualProcessor {
 mod tests {
     use super::*;
     use std;
+    use arch::*;
 
     #[test]
     fn test_create_delete_partition() {
@@ -613,6 +1083,34 @@ mod tests {
 
         let vp_index: UINT32 = 0;
         let vp = p.create_virtual_processor(vp_index).unwrap();
+        drop(vp)
+    }
+
+    #[test]
+    fn test_crate_arch() {
+        let mut p: Partition = Partition::new().unwrap();
+        setup_vcpu_test(&mut p);
+
+        let vp_index: UINT32 = 0;
+        let vp: WhpVcpu = p.create_vcpu(vp_index).unwrap();
+
+        // Call the arch crate with our custom VCPU
+        arch::x86_64::regs::setup_fpu(&vp).unwrap();
+        drop(vp)
+    }
+
+    #[test]
+    fn test_crate_vmm_vcpu() {
+        let mut p: Partition = Partition::new().unwrap();
+        setup_vcpu_test(&mut p);
+
+        let vp_index: UINT32 = 0;
+        let vp: WhpVcpu = p.create_vcpu(vp_index).unwrap();
+
+        // Call the arch crate with our custom VCPU
+        let msrs: MsrEntries = Default::default();
+        vp.set_msrs(&msrs);
+
         drop(vp)
     }
 
