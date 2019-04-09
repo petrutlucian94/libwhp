@@ -182,6 +182,7 @@ fn set_apic_base(vp: &mut VirtualProcessor) {
 
     // Get the registers as a baseline
     vp.get_registers(&reg_names, &mut reg_values).unwrap();
+    // let mut flags = reg_values[0].Reg64 ;
     let mut flags = unsafe { reg_values[0].Reg64 };
 
     // Mask off the bottom 12 bits, which are used to store flags

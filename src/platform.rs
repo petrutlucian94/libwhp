@@ -25,7 +25,8 @@ pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
 
 use vmm_vcpu::vcpu::{Vcpu, Fpu, MsrEntries, SpecialRegisters, VmmRegisters,
-                     SegmentRegister, SegmentDescriptor, VcpuExit, LApicState};
+                     SegmentRegister, SegmentDescriptor, VcpuExit, LApicState,
+                     CpuId};
 use vmm_vcpu::vcpu::Result as VcpuResult;
 
 trait ConvertSegmentRegister {
@@ -418,12 +419,53 @@ impl WhpVcpu {
     }
 }
 
+impl WhpVcpu {
+    fn my_whp_function(&self) {
+        println!("This is not part of the Vcpu trait.");
+    }
+}
+
 impl Vcpu for WhpVcpu {
 
     type RunContextType = WHV_RUN_VP_EXIT_CONTEXT;
 
     fn get_run_context(&self) -> WHV_RUN_VP_EXIT_CONTEXT {
         return self.exit_context;
+    }
+
+    // TODO: These should do the full FPU registers
+    fn get_fpu(&self) -> Result<Fpu, io::Error>{
+        let reg_names: [WHV_REGISTER_NAME; 4] = [
+            WHV_REGISTER_NAME::WHvX64RegisterFpControlStatus,
+            WHV_REGISTER_NAME::WHvX64RegisterXmmControlStatus,
+            WHV_REGISTER_NAME::WHvX64RegisterXmm0,
+            WHV_REGISTER_NAME::WHvX64RegisterFpMmx0,
+        ];
+
+        let mut reg_values: [WHV_REGISTER_VALUE; 4] = Default::default();
+
+        self.get_registers(&reg_names, &mut reg_values)
+            .map_err(|_| io::Error::last_os_error())?;
+
+        let mut fpu: Fpu = Default::default();
+
+        unsafe {
+            fpu.fcw = reg_values[0].Reg64 as UINT16;
+            fpu.mxcsr = reg_values[1].Reg64 as UINT32;
+            fpu.xmm[0][0] = 0;
+        }
+
+        /*
+        unsafe {
+            Ok(Fpu {
+                fcw: reg_values[0].Reg64 as UINT16,
+                mxcsr: reg_values[1].Reg64 as UINT32,
+                fpr[0]: reg_values[2].Reg
+            })
+        }
+        */
+
+        Ok((fpu))
     }
 
     fn set_fpu(&self, fpu: &Fpu) -> Result<(), io::Error> {
@@ -456,6 +498,20 @@ impl Vcpu for WhpVcpu {
         Ok(())
     }
 
+    /// According to the Windows Hypervisor Top Level Functional Specification,
+    /// the virtualized values of CPUID leaves are pre-determined (ie,
+    /// per the specification, each leaf is either set, cleared, or passed-through
+    /// from hardware) and cannot be configured.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn set_cpuid2(&self, cpuid: &CpuId) -> Result<(), io::Error> {
+        unimplemented!();
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn get_msrs(&self, _msrs: &mut MsrEntries) -> Result<i32, io::Error> {
+        Ok((0))
+    }
+
     fn set_msrs(&self, _msrs: &MsrEntries) -> VcpuResult<()> {
         // Need to create a mapping between arch_gen indices of MSRs and the
         // MSRs that WHV exposes. Each mapping will consist of a tuple of
@@ -468,6 +524,7 @@ impl Vcpu for WhpVcpu {
         Ok(())
     }
 
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     fn get_regs(&self) -> Result<VmmRegisters, io::Error> {
         let reg_names: [WHV_REGISTER_NAME; 18] = [
             WHV_REGISTER_NAME::WHvX64RegisterRax,    // 0
@@ -518,6 +575,7 @@ impl Vcpu for WhpVcpu {
         }
     }
 
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     fn set_regs(&self, regs: &VmmRegisters) -> Result<(), io::Error> {
         let reg_names: [WHV_REGISTER_NAME; 18] = [
             WHV_REGISTER_NAME::WHvX64RegisterRax,    // 0 rax
@@ -680,10 +738,10 @@ impl Vcpu for WhpVcpu {
     }
 
     fn get_lapic(&self) -> Result<LApicState, io::Error> {
+        let mut state: LApicState = Default::default();
 
-        let state:LApicState = self.get_lapic_state()
-            .map_err(|_| io::Error::last_os_error())?;
-
+        state = self.get_lapic_state()
+                    .map_err(|_| io::Error::last_os_error())?;
         Ok(state)
     }
 
@@ -692,6 +750,61 @@ impl Vcpu for WhpVcpu {
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
+    }
+
+    fn get_sregs(&self) -> Result<SpecialRegisters, io::Error> {
+        let reg_names: [WHV_REGISTER_NAME; 18] = [
+            WHV_REGISTER_NAME::WHvX64RegisterCs,               // 0
+            WHV_REGISTER_NAME::WHvX64RegisterDs,               // 1
+            WHV_REGISTER_NAME::WHvX64RegisterEs,               // 2
+            WHV_REGISTER_NAME::WHvX64RegisterFs,               // 3
+            WHV_REGISTER_NAME::WHvX64RegisterGs,               // 4
+            WHV_REGISTER_NAME::WHvX64RegisterSs,               // 5
+            WHV_REGISTER_NAME::WHvX64RegisterTr,               // 6
+            WHV_REGISTER_NAME::WHvX64RegisterLdtr,             // 7  ??
+            WHV_REGISTER_NAME::WHvX64RegisterGdtr,             // 8  ??
+            WHV_REGISTER_NAME::WHvX64RegisterIdtr,             // 9  ??
+            WHV_REGISTER_NAME::WHvX64RegisterCr0,              // 10
+            WHV_REGISTER_NAME::WHvX64RegisterCr2,              // 11
+            WHV_REGISTER_NAME::WHvX64RegisterCr3,              // 12
+            WHV_REGISTER_NAME::WHvX64RegisterCr4,              // 13
+            WHV_REGISTER_NAME::WHvX64RegisterCr8,              // 14
+            WHV_REGISTER_NAME::WHvX64RegisterEfer,             // 15
+            WHV_REGISTER_NAME::WHvX64RegisterApicBase,         // 16
+            WHV_REGISTER_NAME::WHvRegisterPendingInterruption, // 17  ??
+        ];
+        let mut reg_values: [WHV_REGISTER_VALUE; 18] = Default::default();
+
+        self.get_registers(&reg_names, &mut reg_values)
+            .map_err(|_| io::Error::last_os_error())?;
+
+        unsafe {
+            Ok(SpecialRegisters {
+                cs: reg_values[0].Segment.to_portable(),
+                ds: reg_values[1].Segment.to_portable(),
+                es: reg_values[2].Segment.to_portable(),
+                fs: reg_values[3].Segment.to_portable(),
+                gs: reg_values[4].Segment.to_portable(),
+                ss: reg_values[5].Segment.to_portable(),
+                tr: reg_values[6].Segment.to_portable(),
+                ldt: reg_values[7].Segment.to_portable(),
+                gdt: reg_values[8].Table.to_portable(),
+                idt: reg_values[9].Table.to_portable(),
+                cr0: reg_values[10].Reg64,
+                cr2: reg_values[11].Reg64,
+                cr3: reg_values[12].Reg64,
+                cr4: reg_values[13].Reg64,
+                cr8: reg_values[14].Reg64,
+                efer: reg_values[15].Reg64,
+                apic_base: reg_values[16].Reg64,
+                interrupt_bitmap: [
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                ],
+            })
+        }
     }
 }
 

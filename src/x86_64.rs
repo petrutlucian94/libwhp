@@ -29,13 +29,11 @@ pub const NUM_REGS: usize = 8;
 pub struct LapicStateRaw {
     pub regs: [::std::os::raw::c_char; 4096usize],
 }
-
 impl Default for LapicStateRaw {
     fn default() -> Self {
         unsafe { ::std::mem::zeroed() }
     }
 }
-
 impl ::std::fmt::Debug for LapicStateRaw {
     fn fmt(&self, fmt: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
         self.regs[..].fmt(fmt)
