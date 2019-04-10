@@ -14,7 +14,6 @@
 // under the License.
 
 use common::*;
-pub use x86_64::{LapicStateRaw, XsaveArea};
 use memory::*;
 use std;
 use std::cell::RefCell;
@@ -23,6 +22,7 @@ use std::io;
 use win_hv_platform::*;
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
+pub use x86_64::XsaveArea;
 
 use vmm_vcpu::vcpu::{Vcpu, Fpu, MsrEntries, SpecialRegisters, VmmRegisters,
                      SegmentRegister, SegmentDescriptor, VcpuExit, LApicState,
@@ -228,21 +228,12 @@ impl Partition {
     }
 
     pub fn create_virtual_processor(&self, index: UINT32) -> Result<VirtualProcessor, WHPError> {
+
+        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
         check_result(unsafe {
             WHvCreateVirtualProcessor(*self.partition.borrow_mut().handle(), index, 0)
         })?;
         Ok(VirtualProcessor {
-            partition: Rc::clone(&self.partition),
-            index: index,
-        })
-    }
-
-    pub fn create_vcpu(&self, index: UINT32) -> Result<WhpVcpu, WHPError> {
-        check_result(unsafe {
-            WHvCreateVirtualProcessor(*self.partition.borrow_mut().handle(), index, 0)
-        })?;
-        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
-        Ok(WhpVcpu {
             partition: Rc::clone(&self.partition),
             index: index,
             exit_context: exit_context,
@@ -309,123 +300,14 @@ impl Drop for GPARangeMapping {
     }
 }
 
-pub struct WhpVcpu {
+pub struct VirtualProcessor {
     partition: Rc<RefCell<PartitionHandle>>,
     index: UINT32,
     exit_context: WHV_RUN_VP_EXIT_CONTEXT,
 }
 
-impl Drop for WhpVcpu{
-    fn drop(&mut self) {
-        check_result(unsafe {
-            WHvDeleteVirtualProcessor(*self.partition.borrow_mut().handle(), self.index)
-        })
-        .unwrap();
-    }
-}
 
-impl WhpVcpu {
-    fn index(&self) -> UINT32 {
-        return self.index;
-    }
-
-    pub fn do_run(&self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
-        let mut exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
-        let exit_context_size = std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as UINT32;
-
-        check_result(unsafe {
-            WHvRunVirtualProcessor(
-                *self.partition.borrow_mut().handle(),
-                self.index,
-                &mut exit_context as *mut _ as *mut VOID,
-                exit_context_size,
-            )
-        })?;
-        Ok(exit_context)
-    }
-
-    pub fn set_registers(
-        &self,
-        reg_names: &[WHV_REGISTER_NAME],
-        reg_values: &[WHV_REGISTER_VALUE],
-    ) -> Result<(), WHPError> {
-        let num_regs = reg_names.len();
-
-        if num_regs != reg_values.len() {
-            panic!("reg_names and reg_values must have the same length")
-        }
-
-        check_result(unsafe {
-            WHvSetVirtualProcessorRegisters(
-                *self.partition.borrow_mut().handle(),
-                self.index,
-                reg_names.as_ptr(),
-                num_regs as UINT32,
-                reg_values.as_ptr(),
-            )
-        })?;
-        Ok(())
-    }
-
-    pub fn get_registers(
-        &self,
-        reg_names: &[WHV_REGISTER_NAME],
-        reg_values: &mut [WHV_REGISTER_VALUE],
-    ) -> Result<(), WHPError> {
-        let num_regs = reg_names.len();
-
-        if num_regs != reg_values.len() {
-            panic!("reg_names and reg_values must have the same length")
-        }
-
-        check_result(unsafe {
-            WHvGetVirtualProcessorRegisters(
-                *self.partition.borrow().handle(),
-                self.index,
-                reg_names.as_ptr(),
-                num_regs as UINT32,
-                reg_values.as_mut_ptr(),
-            )
-        })?;
-        Ok(())
-    }
-
-    pub fn set_lapic_state(&self, state: &LApicState) -> Result<(), WHPError> {
-        check_result(unsafe {
-            WHvSetVirtualProcessorInterruptControllerState(
-                *self.partition.borrow().handle(),
-                self.index,
-                state as *const _ as *const VOID,
-                std::mem::size_of::<LapicStateRaw>() as UINT32,
-            )
-        })?;
-        Ok(())
-    }
-
-    pub fn get_lapic_state(&self) -> Result<LApicState, WHPError> {
-        let mut state: LApicState = Default::default();
-        let mut written_size: UINT32 = 0;
-
-        check_result(unsafe {
-            WHvGetVirtualProcessorInterruptControllerState(
-                *self.partition.borrow().handle(),
-                self.index,
-                &mut state as *mut _ as *mut VOID,
-                std::mem::size_of::<LapicStateRaw>() as UINT32,
-                &mut written_size,
-            )
-        })?;
-        Ok(state)
-    }
-}
-
-impl WhpVcpu {
-    fn my_whp_function(&self) {
-        println!("This is not part of the Vcpu trait.");
-    }
-}
-
-impl Vcpu for WhpVcpu {
+impl Vcpu for VirtualProcessor {
 
     type RunContextType = WHV_RUN_VP_EXIT_CONTEXT;
 
@@ -465,7 +347,7 @@ impl Vcpu for WhpVcpu {
         }
         */
 
-        Ok((fpu))
+        Ok(fpu)
     }
 
     fn set_fpu(&self, fpu: &Fpu) -> Result<(), io::Error> {
@@ -493,7 +375,9 @@ impl Vcpu for WhpVcpu {
         };
         println!("In WHP set_fpu");
 
-        self.set_registers(&reg_names, &reg_values)
+        self.ref_cell
+            .borrow_mut()
+            .set_registers(&reg_names, &reg_values)
             .map_err(|_| io::Error::last_os_error());
         Ok(())
     }
@@ -503,13 +387,13 @@ impl Vcpu for WhpVcpu {
     /// per the specification, each leaf is either set, cleared, or passed-through
     /// from hardware) and cannot be configured.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn set_cpuid2(&self, cpuid: &CpuId) -> Result<(), io::Error> {
+    fn set_cpuid2(&self, _cpuid: &CpuId) -> Result<(), io::Error> {
         unimplemented!();
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn get_msrs(&self, _msrs: &mut MsrEntries) -> Result<i32, io::Error> {
-        Ok((0))
+        Ok(0)
     }
 
     fn set_msrs(&self, _msrs: &MsrEntries) -> VcpuResult<()> {
@@ -695,18 +579,6 @@ impl Vcpu for WhpVcpu {
     }
 
     fn run(&self) -> Result<VcpuExit, io::Error> {
-        let exit_context_size = std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as UINT32;
-
-        /*
-        let result = unsafe {
-            WHvRunVirtualProcessor(
-                *self.partition.borrow_mut().handle(),
-                self.index,
-                &mut exit_context as *mut _ as *mut VOID,
-                exit_context_size,
-            )
-        };
-        */
         let exit_context: WHV_RUN_VP_EXIT_CONTEXT = self.do_run().unwrap();
 
         let exit_reason = 
@@ -808,17 +680,29 @@ impl Vcpu for WhpVcpu {
     }
 }
 
-pub struct VirtualProcessor {
+/*
+pub struct WhpVcpu {
     partition: Rc<RefCell<PartitionHandle>>,
     index: UINT32,
+    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
 }
+
+impl Drop for WhpVcpu{
+    fn drop(&mut self) {
+        check_result(unsafe {
+            WHvDeleteVirtualProcessor(*self.partition.borrow_mut().handle(), self.index)
+        })
+        .unwrap();
+    }
+}
+*/
 
 impl VirtualProcessor {
     pub fn index(&self) -> UINT32 {
         return self.index;
     }
 
-    pub fn run(&mut self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
+    pub fn do_run(&mut self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
         let mut exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
         let exit_context_size = std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as UINT32;
 
@@ -928,8 +812,8 @@ impl VirtualProcessor {
         Ok(bitmap)
     }
 
-    pub fn get_lapic(&self) -> Result<LapicStateRaw, WHPError> {
-        let mut state: LapicStateRaw = Default::default();
+    pub fn get_lapic_state(&self) -> Result<LApicState, WHPError> {
+        let mut state: LApicState = Default::default();
         let mut written_size: UINT32 = 0;
 
         check_result(unsafe {
@@ -937,20 +821,20 @@ impl VirtualProcessor {
                 *self.partition.borrow().handle(),
                 self.index,
                 &mut state as *mut _ as *mut VOID,
-                std::mem::size_of::<LapicStateRaw>() as UINT32,
+                std::mem::size_of::<LApicState>() as UINT32,
                 &mut written_size,
             )
         })?;
         Ok(state)
     }
 
-    pub fn set_lapic(&self, state: &LapicStateRaw) -> Result<(), WHPError> {
+    pub fn set_lapic_state(&self, state: &LApicState) -> Result<(), WHPError> {
         check_result(unsafe {
             WHvSetVirtualProcessorInterruptControllerState(
                 *self.partition.borrow().handle(),
                 self.index,
                 state as *const _ as *const VOID,
-                std::mem::size_of::<LapicStateRaw>() as UINT32,
+                std::mem::size_of::<LApicState>() as UINT32,
             )
         })?;
         Ok(())
@@ -1205,8 +1089,8 @@ mod tests {
         setup_vcpu_test(&mut p);
 
         let vp_index: UINT32 = 0;
-        let vp: WhpVcpu = p.create_vcpu(vp_index).unwrap();
-
+        let vp: VirtualProcessor = p.create_virtual_processor(vp_index).unwrap();
+        
         // Call the arch crate with our custom VCPU
         arch::x86_64::regs::setup_fpu(&vp).unwrap();
         drop(vp)
@@ -1446,14 +1330,14 @@ mod tests {
         let vp = p.create_virtual_processor(vp_index).unwrap();
 
         if apic_enabled == true {
-            let state: LapicStateRaw = vp.get_lapic().unwrap();
+            let state: LApicState = vp.get_lapic().unwrap();
             let icr0 = get_lapic_reg(&state, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0);
 
             // Uses both get_lapic and set_lapic under the hood
             set_reg_in_lapic(&vp, APIC_REG_OFFSET::InterruptCommand0, 0x40);
 
-            let state_out: LapicStateRaw = vp.get_lapic().unwrap();
+            let state_out: LApicState = vp.get_lapic().unwrap();
             let icr0 = get_lapic_reg(&state_out, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0x40);
         }
