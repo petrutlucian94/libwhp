@@ -25,6 +25,7 @@ pub mod x86_64;
 pub mod instruction_emulator;
 pub mod interrupts;
 mod platform;
+mod whp_vcpu;
 mod win_hv_emulation;
 mod win_hv_emulation_defs;
 mod win_hv_platform;
