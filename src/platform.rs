@@ -23,7 +23,7 @@ pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 
-use vmm_vcpu::vcpu::{LApicState};
+use vmm_vcpu::vcpu::{LapicState};
 
 pub fn get_capability(capability_code: WHV_CAPABILITY_CODE) -> Result<WHV_CAPABILITY, WHPError> {
     let mut capability: WHV_CAPABILITY = Default::default();
@@ -159,6 +159,7 @@ impl Partition {
     }
 
     pub fn create_virtual_processor(&self, index: UINT32) -> Result<VirtualProcessor, WHPError> {
+        let mut exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
 
         check_result(unsafe {
             WHvCreateVirtualProcessor(*self.partition.borrow_mut().handle(), index, 0)
@@ -166,6 +167,7 @@ impl Partition {
         Ok(VirtualProcessor {
             partition: Rc::clone(&self.partition),
             index: index,
+            exit_context: exit_context,
         })
     }
 
@@ -232,6 +234,7 @@ impl Drop for GPARangeMapping {
 pub struct VirtualProcessor {
     partition: Rc<RefCell<PartitionHandle>>,
     index: UINT32,
+    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
 }
 
 impl VirtualProcessor {
@@ -239,7 +242,11 @@ impl VirtualProcessor {
         return self.index;
     }
 
-    pub fn do_run(&mut self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
+    pub fn last_exit_context(&self) -> WHV_RUN_VP_EXIT_CONTEXT {
+        return self.exit_context;
+    }
+
+    pub fn do_run(&self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
         let mut exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
         let exit_context_size = std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as UINT32;
 
@@ -262,7 +269,7 @@ impl VirtualProcessor {
     }
 
     pub fn set_registers(
-        &mut self,
+        &self,
         reg_names: &[WHV_REGISTER_NAME],
         reg_values: &[WHV_REGISTER_VALUE],
     ) -> Result<(), WHPError> {
@@ -349,8 +356,8 @@ impl VirtualProcessor {
         Ok(bitmap)
     }
 
-    pub fn get_lapic_state(&self) -> Result<LApicState, WHPError> {
-        let mut state: LApicState = Default::default();
+    pub fn get_lapic_state(&self) -> Result<LapicState, WHPError> {
+        let mut state: LapicState = Default::default();
         let mut written_size: UINT32 = 0;
 
         check_result(unsafe {
@@ -358,20 +365,20 @@ impl VirtualProcessor {
                 *self.partition.borrow().handle(),
                 self.index,
                 &mut state as *mut _ as *mut VOID,
-                std::mem::size_of::<LApicState>() as UINT32,
+                std::mem::size_of::<LapicState>() as UINT32,
                 &mut written_size,
             )
         })?;
         Ok(state)
     }
 
-    pub fn set_lapic_state(&self, state: &LApicState) -> Result<(), WHPError> {
+    pub fn set_lapic_state(&self, state: &LapicState) -> Result<(), WHPError> {
         check_result(unsafe {
             WHvSetVirtualProcessorInterruptControllerState(
                 *self.partition.borrow().handle(),
                 self.index,
                 state as *const _ as *const VOID,
-                std::mem::size_of::<LApicState>() as UINT32,
+                std::mem::size_of::<LapicState>() as UINT32,
             )
         })?;
         Ok(())
@@ -867,14 +874,14 @@ mod tests {
         let vp = p.create_virtual_processor(vp_index).unwrap();
 
         if apic_enabled == true {
-            let state: LApicState = vp.get_lapic().unwrap();
+            let state: LapicState = vp.get_lapic().unwrap();
             let icr0 = get_lapic_reg(&state, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0);
 
             // Uses both get_lapic and set_lapic under the hood
             set_reg_in_lapic(&vp, APIC_REG_OFFSET::InterruptCommand0, 0x40);
 
-            let state_out: LApicState = vp.get_lapic().unwrap();
+            let state_out: LapicState = vp.get_lapic().unwrap();
             let icr0 = get_lapic_reg(&state_out, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0x40);
         }

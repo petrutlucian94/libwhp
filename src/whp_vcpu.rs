@@ -20,26 +20,78 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::io;
 use win_hv_platform::*;
+use platform::VirtualProcessor;
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 
-use vmm_vcpu::vcpu::{Vcpu, Fpu, MsrEntries, SpecialRegisters, VmmRegisters,
-                     SegmentRegister, SegmentDescriptor, VcpuExit, LApicState,
+use vmm_vcpu::vcpu::{Vcpu, FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
+                     SegmentRegister, DescriptorTable, VcpuExit, LapicState,
                      CpuId};
 use vmm_vcpu::vcpu::Result as VcpuResult;
 
-pub struct WhpVcpu {
-    ref_cell: RefCell<libwhp::VirtualProcessor>,
-    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
+trait ConvertSegmentRegister {
+    fn to_portable(&self) -> SegmentRegister;
+    fn from_portable(from: &SegmentRegister) -> Self;
 }
 
-impl Drop for WhpVcpu{
-    fn drop(&mut self) {
-        check_result(unsafe {
-            WHvDeleteVirtualProcessor(*self.partition.borrow_mut().handle(), self.index)
-        })
-        .unwrap();
+impl ConvertSegmentRegister for WHV_X64_SEGMENT_REGISTER {
+    fn to_portable(&self) -> SegmentRegister {
+        SegmentRegister {
+            base: self.Base,
+            limit: self.Limit,
+            selector: self.Selector,
+            type_: self.SegmentType() as u8,
+            present: self.Present() as u8,
+            dpl: self.DescriptorPrivilegeLevel() as u8,
+            db: self.Default() as u8,
+            s: !self.NonSystemSegment() as u8,
+            l: self.Long() as u8,
+            g: self.Granularity() as u8,
+            avl: self.Available() as u8,
+            unusable: 0,
+            padding: 0,
+        }
+    }
+
+    fn from_portable(from: &SegmentRegister) -> WHV_X64_SEGMENT_REGISTER {
+        let mut segment = WHV_X64_SEGMENT_REGISTER {
+            Base: from.base,
+            Limit: from.limit,
+            Selector: from.selector,
+            Attributes: 0,
+        };
+
+        segment.set_SegmentType(from.type_ as u16);
+        segment.set_NonSystemSegment(!from.s as u16);
+        segment.set_Present(from.present as u16);
+        segment.set_Long(from.l as u16);
+        segment.set_Granularity(from.g as u16);
+
+        segment
+    }
+}
+
+trait ConvertDescriptorTable {
+    fn to_portable(&self) -> DescriptorTable;
+    fn from_portable(from: &DescriptorTable) -> Self;
+}
+
+impl ConvertDescriptorTable for WHV_X64_TABLE_REGISTER {
+    fn to_portable(&self) -> DescriptorTable {
+        DescriptorTable {
+            base: self.Base,
+            limit: self.Limit,
+            padding: self.Pad,
+        }
+    }
+
+    fn from_portable(from: &DescriptorTable) -> WHV_X64_TABLE_REGISTER {
+        WHV_X64_TABLE_REGISTER {
+            Base: from.base,
+            Limit: from.limit,
+            Pad: from.padding,
+        }
     }
 }
 
@@ -48,11 +100,11 @@ impl Vcpu for VirtualProcessor {
     type RunContextType = WHV_RUN_VP_EXIT_CONTEXT;
 
     fn get_run_context(&self) -> WHV_RUN_VP_EXIT_CONTEXT {
-        return self.exit_context;
+        self.last_exit_context()
     }
 
     // TODO: These should do the full FPU registers
-    fn get_fpu(&self) -> Result<Fpu, io::Error>{
+    fn get_fpu(&self) -> Result<FpuState, io::Error>{
         let reg_names: [WHV_REGISTER_NAME; 4] = [
             WHV_REGISTER_NAME::WHvX64RegisterFpControlStatus,
             WHV_REGISTER_NAME::WHvX64RegisterXmmControlStatus,
@@ -65,7 +117,7 @@ impl Vcpu for VirtualProcessor {
         self.get_registers(&reg_names, &mut reg_values)
             .map_err(|_| io::Error::last_os_error())?;
 
-        let mut fpu: Fpu = Default::default();
+        let mut fpu: FpuState = Default::default();
 
         unsafe {
             fpu.fcw = reg_values[0].Reg64 as UINT16;
@@ -75,7 +127,7 @@ impl Vcpu for VirtualProcessor {
 
         /*
         unsafe {
-            Ok(Fpu {
+            Ok(FpuState {
                 fcw: reg_values[0].Reg64 as UINT16,
                 mxcsr: reg_values[1].Reg64 as UINT32,
                 fpr[0]: reg_values[2].Reg
@@ -86,7 +138,7 @@ impl Vcpu for VirtualProcessor {
         Ok(fpu)
     }
 
-    fn set_fpu(&self, fpu: &Fpu) -> Result<(), io::Error> {
+    fn set_fpu(&self, fpu: &FpuState) -> Result<(), io::Error> {
         let reg_names: [WHV_REGISTER_NAME; 4] = [
             WHV_REGISTER_NAME::WHvX64RegisterFpControlStatus,
             WHV_REGISTER_NAME::WHvX64RegisterXmmControlStatus,
@@ -111,9 +163,7 @@ impl Vcpu for VirtualProcessor {
         };
         println!("In WHP set_fpu");
 
-        self.ref_cell
-            .borrow_mut()
-            .set_registers(&reg_names, &reg_values)
+        self.set_registers(&reg_names, &reg_values)
             .map_err(|_| io::Error::last_os_error());
         Ok(())
     }
@@ -145,7 +195,7 @@ impl Vcpu for VirtualProcessor {
     }
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-    fn get_regs(&self) -> Result<VmmRegisters, io::Error> {
+    fn get_regs(&self) -> Result<StandardRegisters, io::Error> {
         let reg_names: [WHV_REGISTER_NAME; 18] = [
             WHV_REGISTER_NAME::WHvX64RegisterRax,    // 0
             WHV_REGISTER_NAME::WHvX64RegisterRbx,    // 1
@@ -172,7 +222,7 @@ impl Vcpu for VirtualProcessor {
             .map_err(|_| io::Error::last_os_error())?;
 
         unsafe {
-            Ok(VmmRegisters {
+            Ok(StandardRegisters {
                 rax: reg_values[0].Reg64,
                 rbx: reg_values[1].Reg64,
                 rcx: reg_values[2].Reg64,
@@ -196,7 +246,7 @@ impl Vcpu for VirtualProcessor {
     }
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-    fn set_regs(&self, regs: &VmmRegisters) -> Result<(), io::Error> {
+    fn set_regs(&self, regs: &StandardRegisters) -> Result<(), io::Error> {
         let reg_names: [WHV_REGISTER_NAME; 18] = [
             WHV_REGISTER_NAME::WHvX64RegisterRax,    // 0 rax
             WHV_REGISTER_NAME::WHvX64RegisterRbx,    // 1
@@ -345,15 +395,15 @@ impl Vcpu for VirtualProcessor {
         Ok(exit_reason)
     }
 
-    fn get_lapic(&self) -> Result<LApicState, io::Error> {
-        let mut state: LApicState = Default::default();
+    fn get_lapic(&self) -> Result<LapicState, io::Error> {
+        let mut state: LapicState = Default::default();
 
         state = self.get_lapic_state()
                     .map_err(|_| io::Error::last_os_error())?;
         Ok(state)
     }
 
-    fn set_lapic(&self, klapic: &LApicState) -> Result<(), io::Error> {
+    fn set_lapic(&self, klapic: &LapicState) -> Result<(), io::Error> {
         self.set_lapic_state(klapic)
             .map_err(|_| io::Error::last_os_error())?;
 
@@ -416,255 +466,14 @@ impl Vcpu for VirtualProcessor {
     }
 }
 
-
-impl VirtualProcessor {
-    pub fn index(&self) -> UINT32 {
-        return self.index;
-    }
-
-    pub fn do_run(&mut self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
-        let mut exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
-        let exit_context_size = std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as UINT32;
-
-        check_result(unsafe {
-            WHvRunVirtualProcessor(
-                *self.partition.borrow_mut().handle(),
-                self.index,
-                &mut exit_context as *mut _ as *mut VOID,
-                exit_context_size,
-            )
-        })?;
-        Ok(exit_context)
-    }
-
-    pub fn cancel_run(&mut self) -> Result<(), WHPError> {
-        check_result(unsafe {
-            WHvCancelRunVirtualProcessor(*self.partition.borrow_mut().handle(), self.index, 0)
-        })?;
-        Ok(())
-    }
-
-    pub fn set_registers(
-        &mut self,
-        reg_names: &[WHV_REGISTER_NAME],
-        reg_values: &[WHV_REGISTER_VALUE],
-    ) -> Result<(), WHPError> {
-        let num_regs = reg_names.len();
-
-        if num_regs != reg_values.len() {
-            panic!("reg_names and reg_values must have the same length")
-        }
-
-        check_result(unsafe {
-            WHvSetVirtualProcessorRegisters(
-                *self.partition.borrow_mut().handle(),
-                self.index,
-                reg_names.as_ptr(),
-                num_regs as UINT32,
-                reg_values.as_ptr(),
-            )
-        })?;
-        Ok(())
-    }
-
-    pub fn get_registers(
-        &self,
-        reg_names: &[WHV_REGISTER_NAME],
-        reg_values: &mut [WHV_REGISTER_VALUE],
-    ) -> Result<(), WHPError> {
-        let num_regs = reg_names.len();
-
-        if num_regs != reg_values.len() {
-            panic!("reg_names and reg_values must have the same length")
-        }
-
-        check_result(unsafe {
-            WHvGetVirtualProcessorRegisters(
-                *self.partition.borrow().handle(),
-                self.index,
-                reg_names.as_ptr(),
-                num_regs as UINT32,
-                reg_values.as_mut_ptr(),
-            )
-        })?;
-        Ok(())
-    }
-
-    pub fn translate_gva(
-        &self,
-        gva: WHV_GUEST_VIRTUAL_ADDRESS,
-        flags: WHV_TRANSLATE_GVA_FLAGS,
-    ) -> Result<(WHV_TRANSLATE_GVA_RESULT, WHV_GUEST_PHYSICAL_ADDRESS), WHPError> {
-        let mut gpa: WHV_GUEST_PHYSICAL_ADDRESS = 0;
-        let mut translation_result: WHV_TRANSLATE_GVA_RESULT = Default::default();
-
-        check_result(unsafe {
-            WHvTranslateGva(
-                *self.partition.borrow().handle(),
-                self.index,
-                gva,
-                flags,
-                &mut translation_result,
-                &mut gpa,
-            )
-        })?;
-        Ok((translation_result, gpa))
-    }
-
-    pub fn query_gpa_range_dirty_bitmap(
-        &self,
-        gva: WHV_GUEST_PHYSICAL_ADDRESS,
-        range_size_in_bytes: UINT64,
-        bitmap_size_in_bytes: UINT32,
-    ) -> Result<(Box<[UINT64]>), WHPError> {
-        let num_elem = bitmap_size_in_bytes / std::mem::size_of::<UINT64>() as UINT32;
-        let mut bitmap: Box<[UINT64]> = vec![0; num_elem as usize].into_boxed_slice();
-
-        check_result(unsafe {
-            WHvQueryGpaRangeDirtyBitmap(
-                *self.partition.borrow().handle(),
-                gva,
-                range_size_in_bytes,
-                bitmap.as_mut_ptr(),
-                bitmap_size_in_bytes,
-            )
-        })?;
-        Ok(bitmap)
-    }
-
-    pub fn get_lapic_state(&self) -> Result<LApicState, WHPError> {
-        let mut state: LApicState = Default::default();
-        let mut written_size: UINT32 = 0;
-
-        check_result(unsafe {
-            WHvGetVirtualProcessorInterruptControllerState(
-                *self.partition.borrow().handle(),
-                self.index,
-                &mut state as *mut _ as *mut VOID,
-                std::mem::size_of::<LApicState>() as UINT32,
-                &mut written_size,
-            )
-        })?;
-        Ok(state)
-    }
-
-    pub fn set_lapic_state(&self, state: &LApicState) -> Result<(), WHPError> {
-        check_result(unsafe {
-            WHvSetVirtualProcessorInterruptControllerState(
-                *self.partition.borrow().handle(),
-                self.index,
-                state as *const _ as *const VOID,
-                std::mem::size_of::<LApicState>() as UINT32,
-            )
-        })?;
-        Ok(())
-    }
-
-    pub fn request_interrupt(&self, interrupt: &WHV_INTERRUPT_CONTROL) -> Result<(), WHPError> {
-        check_result(unsafe {
-            WHvRequestInterrupt(
-                *self.partition.borrow_mut().handle(),
-                interrupt,
-                std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as UINT32,
-            )
-        })?;
-        Ok(())
-    }
-
-    #[allow(unreachable_patterns)] // Future-proof against new WHV_PARTITION_COUNTER_SET values
-    pub fn get_partition_counters(
-        &self,
-        partition_counter_set: WHV_PARTITION_COUNTER_SET,
-    ) -> Result<(WHV_PARTITION_COUNTERS), WHPError> {
-        let mut partition_counters: WHV_PARTITION_COUNTERS = Default::default();
-        let mut bytes_written: UINT32 = 0;
-
-        let buffer_size_in_bytes = match partition_counter_set {
-            WHV_PARTITION_COUNTER_SET::WHvPartitionCounterSetMemory => {
-                std::mem::size_of::<WHV_PARTITION_MEMORY_COUNTERS>() as UINT32
-            }
-            _ => panic!("Unknown partition counter set enum value"),
-        };
-
-        check_result(unsafe {
-            WHvGetPartitionCounters(
-                *self.partition.borrow().handle(),
-                partition_counter_set,
-                &mut partition_counters as *mut _ as *mut VOID,
-                buffer_size_in_bytes as UINT32,
-                &mut bytes_written,
-            )
-        })?;
-        Ok(partition_counters)
-    }
-
-    #[allow(unreachable_patterns)] // Future-proof against new WHV_PROCESSOR_COUNTER_SET values
-    pub fn get_processor_counters(
-        &self,
-        processor_counter_set: WHV_PROCESSOR_COUNTER_SET,
-    ) -> Result<WHV_PROCESSOR_COUNTERS, WHPError> {
-        let mut processor_counters: WHV_PROCESSOR_COUNTERS = Default::default();
-        let mut bytes_written: UINT32 = 0;
-
-        let buffer_size_in_bytes = match processor_counter_set {
-            WHV_PROCESSOR_COUNTER_SET::WHvProcessorCounterSetRuntime => {
-                std::mem::size_of::<WHV_PROCESSOR_RUNTIME_COUNTERS>()
-            }
-            WHV_PROCESSOR_COUNTER_SET::WHvProcessorCounterSetIntercepts => {
-                std::mem::size_of::<WHV_PROCESSOR_INTERCEPT_COUNTERS>()
-            }
-            WHV_PROCESSOR_COUNTER_SET::WHvProcessorCounterSetEvents => {
-                std::mem::size_of::<WHV_PROCESSOR_EVENT_COUNTERS>()
-            }
-            WHV_PROCESSOR_COUNTER_SET::WHvProcessorCounterSetApic => {
-                std::mem::size_of::<WHV_PROCESSOR_APIC_COUNTERS>()
-            }
-            _ => panic!("Unknown processor counter set enum value"),
-        };
-
-        check_result(unsafe {
-            WHvGetVirtualProcessorCounters(
-                *self.partition.borrow().handle(),
-                self.index,
-                processor_counter_set,
-                &mut processor_counters as *mut _ as *mut VOID,
-                buffer_size_in_bytes as UINT32,
-                &mut bytes_written,
-            )
-        })?;
-        Ok(processor_counters)
-    }
-
-    pub fn get_xsave_state(&self) -> Result<(XsaveArea), WHPError> {
-        let mut xsave_area: XsaveArea = Default::default();
-        let mut bytes_written: UINT32 = 0;
-
-        check_result(unsafe {
-            WHvGetVirtualProcessorXsaveState(
-                *self.partition.borrow().handle(),
-                self.index,
-                &mut xsave_area as *mut _ as *mut VOID,
-                std::mem::size_of::<XsaveArea>() as UINT32,
-                &mut bytes_written,
-            )
-        })?;
-        Ok(xsave_area)
-    }
-
-    pub fn set_xsave_state(&self, xsave_area: XsaveArea) -> Result<(), WHPError> {
-        check_result(unsafe {
-            WHvSetVirtualProcessorXsaveState(
-                *self.partition.borrow().handle(),
-                self.index,
-                &xsave_area as *const _ as *const VOID,
-                std::mem::size_of::<XsaveArea>() as UINT32,
-            )
-        })?;
-        Ok(())
-    }
+/*
+pub struct WhpVcpu {
+    partition: Rc<RefCell<PartitionHandle>>,
+    index: UINT32,
+    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
 }
 
-impl Drop for VirtualProcessor {
+impl Drop for WhpVcpu{
     fn drop(&mut self) {
         check_result(unsafe {
             WHvDeleteVirtualProcessor(*self.partition.borrow_mut().handle(), self.index)
@@ -672,7 +481,9 @@ impl Drop for VirtualProcessor {
         .unwrap();
     }
 }
+*/
 
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,14 +861,14 @@ mod tests {
         let vp = p.create_virtual_processor(vp_index).unwrap();
 
         if apic_enabled == true {
-            let state: LApicState = vp.get_lapic().unwrap();
+            let state: LapicState = vp.get_lapic().unwrap();
             let icr0 = get_lapic_reg(&state, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0);
 
             // Uses both get_lapic and set_lapic under the hood
             set_reg_in_lapic(&vp, APIC_REG_OFFSET::InterruptCommand0, 0x40);
 
-            let state_out: LApicState = vp.get_lapic().unwrap();
+            let state_out: LapicState = vp.get_lapic().unwrap();
             let icr0 = get_lapic_reg(&state_out, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0x40);
         }
@@ -1115,3 +926,5 @@ mod tests {
         assert_eq!(apic_counters.SentIpiCount, 0);
     }
 }
+
+*/

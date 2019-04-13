@@ -15,10 +15,13 @@
 
 extern crate libc;
 extern crate libwhp;
+extern crate vmm_vcpu;
 
 use libwhp::instruction_emulator::*;
 use libwhp::memory::*;
 use libwhp::*;
+use libwhp::whp_vcpu::*;
+use vmm_vcpu::vcpu::{Vcpu, Fpu};
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -105,48 +108,57 @@ fn main() {
     }
 
     loop {
-        let exit_context = vp_ref_cell.borrow_mut().run().unwrap();
+        //let exit_context = vp_ref_cell.borrow_mut().run().unwrap();
+        vp_ref_cell.borrow().run().unwrap();
 
-        match exit_context.ExitReason {
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => {
-                println!("All done!");
+        {
+            // Keep a reference on the vcpu for as long as we keep a reference
+            // on its run/exit context
+            let vcpu = vp_ref_cell.borrow();
+
+            let exit_context = vcpu.get_run_context();
+
+            match exit_context.ExitReason {
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => {
+                    println!("All done!");
+                    break;
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonException => {
+                    break;
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
+                    handle_mmio_exit(&mut e, &exit_context)
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
+                    handle_io_port_exit(&mut e, &exit_context)
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => {
+                    handle_cpuid_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => {
+                    handle_msr_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => {
+                    continue;
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64InterruptWindow => {
+                    continue;
+                }
+                _ => panic!("Unexpected exit type: {:?}", exit_context.ExitReason),
+            };
+
+            // With the APIC enabled, the hlt instruction will not completely halt
+            // the processor; it'll just halt it until another interrupt is
+            // received, so we don't receive the VMexit that we used to use to end
+            // VCPU execution. Since WHV will not let us disable the APIC in the usual
+            // means (eg, via the global enable flag of the APIC_BASE register,
+            // etc), teriminate the VCPU execution loop when both interrupts we're
+            // expecting have been received. Plus we get to exercise the new
+            // counter APIs.
+            if all_interrupts_received(&vp_ref_cell.borrow()) {
+                println!("All interrupts received. All done!");
                 break;
             }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonException => {
-                break;
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
-                handle_mmio_exit(&mut e, &exit_context)
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
-                handle_io_port_exit(&mut e, &exit_context)
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => {
-                handle_cpuid_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => {
-                handle_msr_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => {
-                continue;
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64InterruptWindow => {
-                continue;
-            }
-            _ => panic!("Unexpected exit type: {:?}", exit_context.ExitReason),
-        };
-
-        // With the APIC enabled, the hlt instruction will not completely halt
-        // the processor; it'll just halt it until another interrupt is
-        // received, so we don't receive the VMexit that we used to use to end
-        // VCPU execution. Since WHV will not let us disable the APIC in the usual
-        // means (eg, via the global enable flag of the APIC_BASE register,
-        // etc), teriminate the VCPU execution loop when both interrupts we're
-        // expecting have been received. Plus we get to exercise the new
-        // counter APIs.
-        if all_interrupts_received(&vp_ref_cell.borrow()) {
-            println!("All interrupts received. All done!");
-            break;
         }
     }
 }

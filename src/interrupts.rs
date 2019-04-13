@@ -22,7 +22,7 @@ use std::io::Cursor;
 use std::mem;
 use std::result;
 
-use vmm_vcpu::vcpu::{Vcpu, LApicState};
+use vmm_vcpu::vcpu::{Vcpu, LapicState};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -51,7 +51,7 @@ impl Display for Error {
     }
 }
 
-pub fn get_lapic_reg(lapic: &LApicState, reg_offset: APIC_REG_OFFSET) -> u32 {
+pub fn get_lapic_reg(lapic: &LapicState, reg_offset: APIC_REG_OFFSET) -> u32 {
     let sliceu8 = unsafe {
         // This array is only accessed as parts of a u32 word, so interpret it as a u8 array.
         // Cursors are only readable on arrays of u8, not i8(c_char).
@@ -62,7 +62,7 @@ pub fn get_lapic_reg(lapic: &LApicState, reg_offset: APIC_REG_OFFSET) -> u32 {
     reader.read_u32::<LittleEndian>().unwrap()
 }
 
-pub fn set_lapic_reg(lapic: &mut LApicState, reg_offset: APIC_REG_OFFSET, value: u32) {
+pub fn set_lapic_reg(lapic: &mut LapicState, reg_offset: APIC_REG_OFFSET, value: u32) {
     let sliceu8 = unsafe {
         // This array is only accessed as parts of a u32 word, so interpret it as a u8 array.
         // Cursors are only readable on arrays of u8, not i8(c_char).
@@ -74,14 +74,14 @@ pub fn set_lapic_reg(lapic: &mut LApicState, reg_offset: APIC_REG_OFFSET, value:
 }
 
 pub fn get_reg_from_lapic<T: Vcpu>(vcpu: &T, reg_offset: APIC_REG_OFFSET) -> u32 {
-    //let lapic: LApicState = vcpu.get_lapic().map_err(Error::GetLapic).unwrap();
-    let lapic: LApicState = vcpu.get_lapic().unwrap();
+    //let lapic: LapicState = vcpu.get_lapic().map_err(Error::GetLapic).unwrap();
+    let lapic: LapicState = vcpu.get_lapic().unwrap();
 
     get_lapic_reg(&lapic, reg_offset)
 }
 
 pub fn set_reg_in_lapic<T: Vcpu>(vcpu: &T, reg_offset: APIC_REG_OFFSET, value: u32) {
-    let mut lapic: LApicState = vcpu.get_lapic().unwrap();
+    let mut lapic: LapicState = vcpu.get_lapic().unwrap();
 
     set_lapic_reg(&mut lapic, reg_offset, value);
 
