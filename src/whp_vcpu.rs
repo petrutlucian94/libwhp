@@ -14,10 +14,6 @@
 // under the License.
 
 use common::*;
-use memory::*;
-use std;
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::io;
 use win_hv_platform::*;
 use platform::VirtualProcessor;
@@ -25,10 +21,92 @@ pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 
-use vmm_vcpu::vcpu::{Vcpu, FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
-                     SegmentRegister, DescriptorTable, VcpuExit, LapicState,
-                     CpuId};
-use vmm_vcpu::vcpu::Result as VcpuResult;
+use vmm_vcpu::vcpu::{Vcpu, VcpuExit};
+use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
+                     SegmentRegister, DescriptorTable, LapicState, CpuId};
+//use vmm_vcpu::vcpu::Result as VcpuResult;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum WHvStdRegIdx {
+    rax = 0x00,
+    rcx = 0x01,
+    rdx = 0x02,
+    rbx = 0x03,
+    rsp = 0x04,
+    rbp = 0x05,
+    rsi = 0x06,
+    rdi = 0x07,
+    r8 = 0x08,
+    r9 = 0x09,
+    r10 = 0x0A,
+    r11 = 0x0B,
+    r12 = 0x0C,
+    r13 = 0x0D,
+    r14 = 0x0E,
+    r15 = 0x0F,
+    rip = 0x10,
+    rflags = 0x11,
+}
+
+pub struct WHvStandardRegisterMapping {
+    reg_names: [WHV_REGISTER_NAME; 18],
+    //reg_values: [WHV_REGISTER_VALUE; 18],
+}
+
+impl Default for WHvStandardRegisterMapping {
+    fn default() -> Self {
+        /*
+        let mapping: WHvStandardRegisterMapping = WHvStandardRegisterMapping {
+            reg_names: [0; 18],
+            reg_values: [0; 18],
+        };
+        */
+        let mapping: WHvStandardRegisterMapping = WHvStandardRegisterMapping {
+            reg_names[WHvStdRegIdx::rax] = WHV_REGISTER_NAME::WHvX64RegisterRax;
+            reg_names[WHvStdRegIdx::rcx] = WHV_REGISTER_NAME::WHvX64RegisterRcx;
+            reg_names[WHvStdRegIdx::rdx] = WHV_REGISTER_NAME::WHvX64RegisterRdx;
+            reg_names[WHvStdRegIdx::rbx] = WHV_REGISTER_NAME::WHvX64RegisterRbx;
+            reg_names[WHvStdRegIdx::rsp] = WHV_REGISTER_NAME::WHvX64RegisterRsp;
+            reg_names[WHvStdRegIdx::rbp] = WHV_REGISTER_NAME::WHvX64RegisterRbp;
+            reg_names[WHvStdRegIdx::rsi] = WHV_REGISTER_NAME::WHvX64RegisterRsi;
+            reg_names[WHvStdRegIdx::rdi] = WHV_REGISTER_NAME::WHvX64RegisterRdi;
+            reg_names[WHvStdRegIdx::r8] = WHV_REGISTER_NAME::WHvX64RegisterR8;
+            reg_names[WHvStdRegIdx::r9] = WHV_REGISTER_NAME::WHvX64RegisterR9;
+            reg_names[WHvStdRegIdx::r10] = WHV_REGISTER_NAME::WHvX64RegisterR10;
+            reg_names[WHvStdRegIdx::r11] = WHV_REGISTER_NAME::WHvX64RegisterR11;
+            reg_names[WHvStdRegIdx::r12] = WHV_REGISTER_NAME::WHvX64RegisterR12;
+            reg_names[WHvStdRegIdx::r13] = WHV_REGISTER_NAME::WHvX64RegisterR13;
+            reg_names[WHvStdRegIdx::r14] = WHV_REGISTER_NAME::WHvX64RegisterR14;
+            reg_names[WHvStdRegIdx::r15] = WHV_REGISTER_NAME::WHvX64RegisterR15;
+            reg_names[WHvStdRegIdx::rip] = WHV_REGISTER_NAME::WHvX64RegisterRip;
+            reg_names[WHvStdRegIdx::rflags] = WHV_REGISTER_NAME::WHvX64RegisterRflags;
+
+            /*
+            Self.reg_names[WHvStdRegIdx::rax] = WHV_REGISTER_NAME::WHvX64RegisterRax;
+            Self.reg_names[WHvStdRegIdx::rcx] = WHV_REGISTER_NAME::WHvX64RegisterRcx;
+            Self.reg_names[WHvStdRegIdx::rdx] = WHV_REGISTER_NAME::WHvX64RegisterRdx;
+            Self.reg_names[WHvStdRegIdx::rbx] = WHV_REGISTER_NAME::WHvX64RegisterRbx;
+
+            Self.reg_names[WHvStdRegIdx::rsp] = WHV_REGISTER_NAME::WHvX64RegisterRsp;
+            Self.reg_names[WHvStdRegIdx::rbp] = WHV_REGISTER_NAME::WHvX64RegisterRbp;
+            Self.reg_names[WHvStdRegIdx::rsi] = WHV_REGISTER_NAME::WHvX64RegisterRsi;
+            Self.reg_names[WHvStdRegIdx::rdi] = WHV_REGISTER_NAME::WHvX64RegisterRdi;
+
+            Self.reg_names[WHvStdRegIdx::r8] = WHV_REGISTER_NAME::WHvX64RegisterR8;
+            Self.reg_names[WHvStdRegIdx::r9] = WHV_REGISTER_NAME::WHvX64RegisterR9;
+            Self.reg_names[WHvStdRegIdx::r10] = WHV_REGISTER_NAME::WHvX64RegisterR10;
+            Self.reg_names[WHvStdRegIdx::r11] = WHV_REGISTER_NAME::WHvX64RegisterR11;
+            Self.reg_names[WHvStdRegIdx::r12] = WHV_REGISTER_NAME::WHvX64RegisterR12;
+            Self.reg_names[WHvStdRegIdx::r13] = WHV_REGISTER_NAME::WHvX64RegisterR13;
+            Self.reg_names[WHvStdRegIdx::r14] = WHV_REGISTER_NAME::WHvX64RegisterR14;
+            Self.reg_names[WHvStdRegIdx::r15] = WHV_REGISTER_NAME::WHvX64RegisterR15;
+
+            Self.reg_names[WHvStdRegIdx::rip] = WHV_REGISTER_NAME::WHvX64RegisterRip;
+            Self.reg_names[WHvStdRegIdx::rflags] = WHV_REGISTER_NAME::WHvX64RegisterRflags;
+            */
+    }
+}
 
 trait ConvertSegmentRegister {
     fn to_portable(&self) -> SegmentRegister;
@@ -182,7 +260,7 @@ impl Vcpu for VirtualProcessor {
         Ok(0)
     }
 
-    fn set_msrs(&self, _msrs: &MsrEntries) -> VcpuResult<()> {
+    fn set_msrs(&self, _msrs: &MsrEntries) -> Result<(), io::Error> {
         // Need to create a mapping between arch_gen indices of MSRs and the
         // MSRs that WHV exposes. Each mapping will consist of a tuple of
         // the MSR index and the WHV register name. Non-supported MSRs should
@@ -247,26 +325,8 @@ impl Vcpu for VirtualProcessor {
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     fn set_regs(&self, regs: &StandardRegisters) -> Result<(), io::Error> {
-        let reg_names: [WHV_REGISTER_NAME; 18] = [
-            WHV_REGISTER_NAME::WHvX64RegisterRax,    // 0 rax
-            WHV_REGISTER_NAME::WHvX64RegisterRbx,    // 1
-            WHV_REGISTER_NAME::WHvX64RegisterRcx,    // 2
-            WHV_REGISTER_NAME::WHvX64RegisterRdx,    // 3
-            WHV_REGISTER_NAME::WHvX64RegisterRsi,    // 4
-            WHV_REGISTER_NAME::WHvX64RegisterRdi,    // 5
-            WHV_REGISTER_NAME::WHvX64RegisterRsp,    // 6
-            WHV_REGISTER_NAME::WHvX64RegisterRbp,    // 7  ??
-            WHV_REGISTER_NAME::WHvX64RegisterR8,     // 8  ??
-            WHV_REGISTER_NAME::WHvX64RegisterR9,     // 9  ??
-            WHV_REGISTER_NAME::WHvX64RegisterR10,    // 10
-            WHV_REGISTER_NAME::WHvX64RegisterR11,    // 11
-            WHV_REGISTER_NAME::WHvX64RegisterR12,    // 12
-            WHV_REGISTER_NAME::WHvX64RegisterR13,    // 13
-            WHV_REGISTER_NAME::WHvX64RegisterR14,    // 14
-            WHV_REGISTER_NAME::WHvX64RegisterR15,    // 15
-            WHV_REGISTER_NAME::WHvX64RegisterRip,    // 16
-            WHV_REGISTER_NAME::WHvX64RegisterRflags, // 17  ??
-        ];
+        //let mut regs: WHvStandardRegisterMapping = Default::default();
+        /*
         let reg_values: [WHV_REGISTER_VALUE; 18] = [
             WHV_REGISTER_VALUE { Reg64: regs.rax },    // 0: Rax
             WHV_REGISTER_VALUE { Reg64: regs.rbx },    // 1: Rbx
@@ -290,6 +350,7 @@ impl Vcpu for VirtualProcessor {
 
         self.set_registers(&reg_names, &reg_values)
             .map_err(|_| io::Error::last_os_error())?;
+            */
 
         Ok(())
     }
@@ -313,7 +374,7 @@ impl Vcpu for VirtualProcessor {
             WHV_REGISTER_NAME::WHvX64RegisterCr8,  // 14
             WHV_REGISTER_NAME::WHvX64RegisterEfer, // 15
             WHV_REGISTER_NAME::WHvX64RegisterApicBase, // 16
-                                                   //            WHV_REGISTER_NAME::WHvRegisterPendingInterruption, // 17
+    //            WHV_REGISTER_NAME::WHvRegisterPendingInterruption, // 17
         ];
         let reg_values: [WHV_REGISTER_VALUE; 17] = [
             WHV_REGISTER_VALUE {
@@ -488,7 +549,6 @@ impl Drop for WhpVcpu{
 mod tests {
     use super::*;
     use std;
-    use arch::*;
 
     #[test]
     fn test_create_delete_partition() {
@@ -611,34 +671,6 @@ mod tests {
 
         let vp_index: UINT32 = 0;
         let vp = p.create_virtual_processor(vp_index).unwrap();
-        drop(vp)
-    }
-
-    #[test]
-    fn test_crate_arch() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let vp: VirtualProcessor = p.create_virtual_processor(vp_index).unwrap();
-        
-        // Call the arch crate with our custom VCPU
-        arch::x86_64::regs::setup_fpu(&vp).unwrap();
-        drop(vp)
-    }
-
-    #[test]
-    fn test_crate_vmm_vcpu() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let vp: WhpVcpu = p.create_vcpu(vp_index).unwrap();
-
-        // Call the arch crate with our custom VCPU
-        let msrs: MsrEntries = Default::default();
-        vp.set_msrs(&msrs);
-
         drop(vp)
     }
 

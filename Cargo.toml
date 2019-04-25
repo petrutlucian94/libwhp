@@ -16,7 +16,6 @@ libc = "0.2"
 bitflags = "1.0"
 byteorder = "=1.2.1"
 vmm-vcpu = { path = "../vmm-vcpu"}
-arch = { path = "../arch"}
 
 [lib]
 crate-type = ["rlib", "dylib"]

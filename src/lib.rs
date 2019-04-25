@@ -15,7 +15,6 @@
 
 extern crate libc;
 extern crate vmm_vcpu;
-extern crate arch;
 
 #[macro_use]
 mod macros;

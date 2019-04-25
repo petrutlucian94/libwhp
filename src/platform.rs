@@ -501,7 +501,6 @@ impl Drop for VirtualProcessor {
 mod tests {
     use super::*;
     use std;
-    use arch::*;
 
     #[test]
     fn test_create_delete_partition() {
@@ -624,34 +623,6 @@ mod tests {
 
         let vp_index: UINT32 = 0;
         let vp = p.create_virtual_processor(vp_index).unwrap();
-        drop(vp)
-    }
-
-    #[test]
-    fn test_crate_arch() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let vp: VirtualProcessor = p.create_virtual_processor(vp_index).unwrap();
-        
-        // Call the arch crate with our custom VCPU
-        arch::x86_64::regs::setup_fpu(&vp).unwrap();
-        drop(vp)
-    }
-
-    #[test]
-    fn test_crate_vmm_vcpu() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let vp: WhpVcpu = p.create_vcpu(vp_index).unwrap();
-
-        // Call the arch crate with our custom VCPU
-        let msrs: MsrEntries = Default::default();
-        vp.set_msrs(&msrs);
-
         drop(vp)
     }
 
