@@ -15,8 +15,7 @@
 
 use common::*;
 use std::io;
-use win_hv_platform::*;
-use platform::VirtualProcessor;
+use platform::{Partition, VirtualProcessor};
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
@@ -26,87 +25,148 @@ use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters
                      SegmentRegister, DescriptorTable, LapicState, CpuId};
 //use vmm_vcpu::vcpu::Result as VcpuResult;
 
+///
+/// Enumerate the index at which each register will be stored within the
+/// WinStandardRegisters
+/// 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum WHvStdRegIdx {
-    rax = 0x00,
-    rcx = 0x01,
-    rdx = 0x02,
-    rbx = 0x03,
-    rsp = 0x04,
-    rbp = 0x05,
-    rsi = 0x06,
-    rdi = 0x07,
-    r8 = 0x08,
-    r9 = 0x09,
-    r10 = 0x0A,
-    r11 = 0x0B,
-    r12 = 0x0C,
-    r13 = 0x0D,
-    r14 = 0x0E,
-    r15 = 0x0F,
-    rip = 0x10,
-    rflags = 0x11,
+pub enum WinStandardRegIndex {
+    Rax = 0x00,
+    Rcx = 0x01,
+    Rdx = 0x02,
+    Rbx = 0x03,
+    Rsp = 0x04,
+    Rbp = 0x05,
+    Rsi = 0x06,
+    Rdi = 0x07,
+    R8 = 0x08,
+    R9 = 0x09,
+    R10 = 0x0A,
+    R11 = 0x0B,
+    R12 = 0x0C,
+    R13 = 0x0D,
+    R14 = 0x0E,
+    R15 = 0x0F,
+    Rip = 0x10,
+    Rflags = 0x11,
 }
 
-pub struct WHvStandardRegisterMapping {
-    reg_names: [WHV_REGISTER_NAME; 18],
-    //reg_values: [WHV_REGISTER_VALUE; 18],
+///
+/// Create a structure to hold the corresponding arrays of the WHV_REGISTER_NAMEs
+/// and WHV_REGISTER_VALUEs that comprise the StandardRegisters, with
+/// WHV_REGISTER_NAMEs prepopulated on default initialization, and both arrays
+/// accessible via the WinStandardRegIndex enum defined above
+///
+#[derive(Copy, Clone)]
+pub struct WinStandardRegisters {
+    names: [WHV_REGISTER_NAME; 18],
+    values: [WHV_REGISTER_VALUE; 18],
 }
 
-impl Default for WHvStandardRegisterMapping {
+impl Default for WinStandardRegisters {
     fn default() -> Self {
-        /*
-        let mapping: WHvStandardRegisterMapping = WHvStandardRegisterMapping {
-            reg_names: [0; 18],
-            reg_values: [0; 18],
+        //unsafe { ::std::mem::zeroed() }
+        let mut mapping = WinStandardRegisters {
+            names: Default::default(),
+            values: Default::default(),
         };
-        */
-        let mapping: WHvStandardRegisterMapping = WHvStandardRegisterMapping {
-            reg_names[WHvStdRegIdx::rax] = WHV_REGISTER_NAME::WHvX64RegisterRax;
-            reg_names[WHvStdRegIdx::rcx] = WHV_REGISTER_NAME::WHvX64RegisterRcx;
-            reg_names[WHvStdRegIdx::rdx] = WHV_REGISTER_NAME::WHvX64RegisterRdx;
-            reg_names[WHvStdRegIdx::rbx] = WHV_REGISTER_NAME::WHvX64RegisterRbx;
-            reg_names[WHvStdRegIdx::rsp] = WHV_REGISTER_NAME::WHvX64RegisterRsp;
-            reg_names[WHvStdRegIdx::rbp] = WHV_REGISTER_NAME::WHvX64RegisterRbp;
-            reg_names[WHvStdRegIdx::rsi] = WHV_REGISTER_NAME::WHvX64RegisterRsi;
-            reg_names[WHvStdRegIdx::rdi] = WHV_REGISTER_NAME::WHvX64RegisterRdi;
-            reg_names[WHvStdRegIdx::r8] = WHV_REGISTER_NAME::WHvX64RegisterR8;
-            reg_names[WHvStdRegIdx::r9] = WHV_REGISTER_NAME::WHvX64RegisterR9;
-            reg_names[WHvStdRegIdx::r10] = WHV_REGISTER_NAME::WHvX64RegisterR10;
-            reg_names[WHvStdRegIdx::r11] = WHV_REGISTER_NAME::WHvX64RegisterR11;
-            reg_names[WHvStdRegIdx::r12] = WHV_REGISTER_NAME::WHvX64RegisterR12;
-            reg_names[WHvStdRegIdx::r13] = WHV_REGISTER_NAME::WHvX64RegisterR13;
-            reg_names[WHvStdRegIdx::r14] = WHV_REGISTER_NAME::WHvX64RegisterR14;
-            reg_names[WHvStdRegIdx::r15] = WHV_REGISTER_NAME::WHvX64RegisterR15;
-            reg_names[WHvStdRegIdx::rip] = WHV_REGISTER_NAME::WHvX64RegisterRip;
-            reg_names[WHvStdRegIdx::rflags] = WHV_REGISTER_NAME::WHvX64RegisterRflags;
 
-            /*
-            Self.reg_names[WHvStdRegIdx::rax] = WHV_REGISTER_NAME::WHvX64RegisterRax;
-            Self.reg_names[WHvStdRegIdx::rcx] = WHV_REGISTER_NAME::WHvX64RegisterRcx;
-            Self.reg_names[WHvStdRegIdx::rdx] = WHV_REGISTER_NAME::WHvX64RegisterRdx;
-            Self.reg_names[WHvStdRegIdx::rbx] = WHV_REGISTER_NAME::WHvX64RegisterRbx;
+        mapping.names[WinStandardRegIndex::Rax as usize] = WHV_REGISTER_NAME::WHvX64RegisterRax;
+        mapping.names[WinStandardRegIndex::Rcx as usize] = WHV_REGISTER_NAME::WHvX64RegisterRcx;
+        mapping.names[WinStandardRegIndex::Rdx as usize] = WHV_REGISTER_NAME::WHvX64RegisterRdx;
+        mapping.names[WinStandardRegIndex::Rbx as usize] = WHV_REGISTER_NAME::WHvX64RegisterRbx;
+        mapping.names[WinStandardRegIndex::Rsp as usize] = WHV_REGISTER_NAME::WHvX64RegisterRsp;
+        mapping.names[WinStandardRegIndex::Rbp as usize] = WHV_REGISTER_NAME::WHvX64RegisterRbp;
+        mapping.names[WinStandardRegIndex::Rsi as usize] = WHV_REGISTER_NAME::WHvX64RegisterRsi;
+        mapping.names[WinStandardRegIndex::Rdi as usize] = WHV_REGISTER_NAME::WHvX64RegisterRdi;
+        mapping.names[WinStandardRegIndex::R8 as usize] = WHV_REGISTER_NAME::WHvX64RegisterR8;
+        mapping.names[WinStandardRegIndex::R9 as usize] = WHV_REGISTER_NAME::WHvX64RegisterR9;
+        mapping.names[WinStandardRegIndex::R10 as usize] = WHV_REGISTER_NAME::WHvX64RegisterR10;
+        mapping.names[WinStandardRegIndex::R11 as usize] = WHV_REGISTER_NAME::WHvX64RegisterR11;
+        mapping.names[WinStandardRegIndex::R12 as usize] = WHV_REGISTER_NAME::WHvX64RegisterR12;
+        mapping.names[WinStandardRegIndex::R13 as usize] = WHV_REGISTER_NAME::WHvX64RegisterR13;
+        mapping.names[WinStandardRegIndex::R14 as usize] = WHV_REGISTER_NAME::WHvX64RegisterR14;
+        mapping.names[WinStandardRegIndex::R15 as usize] = WHV_REGISTER_NAME::WHvX64RegisterR15;
+        mapping.names[WinStandardRegIndex::Rip as usize] = WHV_REGISTER_NAME::WHvX64RegisterRip;
+        mapping.names[WinStandardRegIndex::Rflags as usize] = WHV_REGISTER_NAME::WHvX64RegisterRflags;
 
-            Self.reg_names[WHvStdRegIdx::rsp] = WHV_REGISTER_NAME::WHvX64RegisterRsp;
-            Self.reg_names[WHvStdRegIdx::rbp] = WHV_REGISTER_NAME::WHvX64RegisterRbp;
-            Self.reg_names[WHvStdRegIdx::rsi] = WHV_REGISTER_NAME::WHvX64RegisterRsi;
-            Self.reg_names[WHvStdRegIdx::rdi] = WHV_REGISTER_NAME::WHvX64RegisterRdi;
-
-            Self.reg_names[WHvStdRegIdx::r8] = WHV_REGISTER_NAME::WHvX64RegisterR8;
-            Self.reg_names[WHvStdRegIdx::r9] = WHV_REGISTER_NAME::WHvX64RegisterR9;
-            Self.reg_names[WHvStdRegIdx::r10] = WHV_REGISTER_NAME::WHvX64RegisterR10;
-            Self.reg_names[WHvStdRegIdx::r11] = WHV_REGISTER_NAME::WHvX64RegisterR11;
-            Self.reg_names[WHvStdRegIdx::r12] = WHV_REGISTER_NAME::WHvX64RegisterR12;
-            Self.reg_names[WHvStdRegIdx::r13] = WHV_REGISTER_NAME::WHvX64RegisterR13;
-            Self.reg_names[WHvStdRegIdx::r14] = WHV_REGISTER_NAME::WHvX64RegisterR14;
-            Self.reg_names[WHvStdRegIdx::r15] = WHV_REGISTER_NAME::WHvX64RegisterR15;
-
-            Self.reg_names[WHvStdRegIdx::rip] = WHV_REGISTER_NAME::WHvX64RegisterRip;
-            Self.reg_names[WHvStdRegIdx::rflags] = WHV_REGISTER_NAME::WHvX64RegisterRflags;
-            */
+        mapping
     }
 }
+
+///
+/// Enumerate the index at which each register will be stored within the
+/// WinSpecialRegisters
+/// 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum WinSpecialRegIndex {
+    Cs,
+    Ds,
+    Es,
+    Fs,
+    Gs,
+    Ss,
+    Tr,
+    Ldt,
+    Gdt,
+    Idt,
+    Cr0,
+    Cr2,
+    Cr3,
+    Cr4,
+    Cr8,
+    Efer,
+    ApicBase,
+}
+
+///
+/// Create a structure to hold the corresponding arrays of the WHV_REGISTER_NAMEs
+/// and WHV_REGISTER_VALUEs that comprise the SpecialRegisters, with
+/// WHV_REGISTER_NAMEs prepopulated on default initialization, and both arrays
+/// accessible via the WinSpecialRegIndex enum defined above
+///
+#[derive(Copy, Clone)]
+pub struct WinSpecialRegisters {
+    names: [WHV_REGISTER_NAME; 17],
+    values: [WHV_REGISTER_VALUE; 17],
+}
+
+impl Default for WinSpecialRegisters {
+    fn default() -> Self {
+        //unsafe { ::std::mem::zeroed() }
+        let mut mapping = WinSpecialRegisters {
+            names: Default::default(),
+            values: Default::default(),
+        };
+
+        mapping.names[WinSpecialRegIndex::Cs as usize] = WHV_REGISTER_NAME::WHvX64RegisterCs;
+        mapping.names[WinSpecialRegIndex::Ds as usize] = WHV_REGISTER_NAME::WHvX64RegisterDs;
+        mapping.names[WinSpecialRegIndex::Es as usize] = WHV_REGISTER_NAME::WHvX64RegisterEs;
+        mapping.names[WinSpecialRegIndex::Fs as usize] = WHV_REGISTER_NAME::WHvX64RegisterFs;
+        mapping.names[WinSpecialRegIndex::Gs as usize] = WHV_REGISTER_NAME::WHvX64RegisterGs;
+        mapping.names[WinSpecialRegIndex::Ss as usize] = WHV_REGISTER_NAME::WHvX64RegisterSs;
+
+        mapping.names[WinSpecialRegIndex::Tr as usize] = WHV_REGISTER_NAME::WHvX64RegisterTr;
+        mapping.names[WinSpecialRegIndex::Ldt as usize] = WHV_REGISTER_NAME::WHvX64RegisterLdtr;
+        mapping.names[WinSpecialRegIndex::Gdt as usize] = WHV_REGISTER_NAME::WHvX64RegisterGdtr;
+        mapping.names[WinSpecialRegIndex::Idt as usize] = WHV_REGISTER_NAME::WHvX64RegisterIdtr;
+
+        mapping.names[WinSpecialRegIndex::Cr0 as usize] = WHV_REGISTER_NAME::WHvX64RegisterCr0;
+        mapping.names[WinSpecialRegIndex::Cr2 as usize] = WHV_REGISTER_NAME::WHvX64RegisterCr2;
+        mapping.names[WinSpecialRegIndex::Cr3 as usize] = WHV_REGISTER_NAME::WHvX64RegisterCr3;
+        mapping.names[WinSpecialRegIndex::Cr4 as usize] = WHV_REGISTER_NAME::WHvX64RegisterCr4;
+        mapping.names[WinSpecialRegIndex::Cr8 as usize] = WHV_REGISTER_NAME::WHvX64RegisterCr8;
+
+        mapping.names[WinSpecialRegIndex::Efer as usize] = WHV_REGISTER_NAME::WHvX64RegisterEfer;
+        mapping.names[WinSpecialRegIndex::ApicBase as usize] = WHV_REGISTER_NAME::WHvX64RegisterApicBase;
+
+        mapping
+    }
+}
+
+
 
 trait ConvertSegmentRegister {
     fn to_portable(&self) -> SegmentRegister;
@@ -242,7 +302,7 @@ impl Vcpu for VirtualProcessor {
         println!("In WHP set_fpu");
 
         self.set_registers(&reg_names, &reg_values)
-            .map_err(|_| io::Error::last_os_error());
+            .map_err(|_| io::Error::last_os_error()).unwrap();
         Ok(())
     }
 
@@ -267,159 +327,118 @@ impl Vcpu for VirtualProcessor {
         // be empty/identifiabler
 
         let sregs: SpecialRegisters = Default::default();
-        self.set_sregs(&sregs);
+        self.set_sregs(&sregs)?;
         println!("In WHP set_msrs");
         Ok(())
     }
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     fn get_regs(&self) -> Result<StandardRegisters, io::Error> {
-        let reg_names: [WHV_REGISTER_NAME; 18] = [
-            WHV_REGISTER_NAME::WHvX64RegisterRax,    // 0
-            WHV_REGISTER_NAME::WHvX64RegisterRbx,    // 1
-            WHV_REGISTER_NAME::WHvX64RegisterRcx,    // 2
-            WHV_REGISTER_NAME::WHvX64RegisterRdx,    // 3
-            WHV_REGISTER_NAME::WHvX64RegisterRsi,    // 4
-            WHV_REGISTER_NAME::WHvX64RegisterRdi,    // 5
-            WHV_REGISTER_NAME::WHvX64RegisterRsp,    // 6
-            WHV_REGISTER_NAME::WHvX64RegisterRbp,    // 7
-            WHV_REGISTER_NAME::WHvX64RegisterR8,     // 8
-            WHV_REGISTER_NAME::WHvX64RegisterR9,     // 9
-            WHV_REGISTER_NAME::WHvX64RegisterR10,    // 10
-            WHV_REGISTER_NAME::WHvX64RegisterR11,    // 11
-            WHV_REGISTER_NAME::WHvX64RegisterR12,    // 12
-            WHV_REGISTER_NAME::WHvX64RegisterR13,    // 13
-            WHV_REGISTER_NAME::WHvX64RegisterR14,    // 14
-            WHV_REGISTER_NAME::WHvX64RegisterR15,    // 15
-            WHV_REGISTER_NAME::WHvX64RegisterRip,    // 16
-            WHV_REGISTER_NAME::WHvX64RegisterRflags, // 17  ??
-        ];
-        let mut reg_values: [WHV_REGISTER_VALUE; 18] = Default::default();
+        let mut win_regs: WinStandardRegisters = Default::default();
 
-        self.get_registers(&reg_names, &mut reg_values)
+        self.get_registers(&win_regs.names, &mut win_regs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
         unsafe {
             Ok(StandardRegisters {
-                rax: reg_values[0].Reg64,
-                rbx: reg_values[1].Reg64,
-                rcx: reg_values[2].Reg64,
-                rdx: reg_values[3].Reg64,
-                rsi: reg_values[4].Reg64,
-                rdi: reg_values[5].Reg64,
-                rsp: reg_values[6].Reg64,
-                rbp: reg_values[7].Reg64,
-                r8: reg_values[8].Reg64,
-                r9: reg_values[9].Reg64,
-                r10: reg_values[10].Reg64,
-                r11: reg_values[11].Reg64,
-                r12: reg_values[12].Reg64,
-                r13: reg_values[13].Reg64,
-                r14: reg_values[14].Reg64,
-                r15: reg_values[15].Reg64,
-                rip: reg_values[16].Reg64,
-                rflags: reg_values[17].Reg64,
+                rax: win_regs.values[WinStandardRegIndex::Rax as usize].Reg64,
+                rbx: win_regs.values[WinStandardRegIndex::Rbx as usize].Reg64,
+                rcx: win_regs.values[WinStandardRegIndex::Rcx as usize].Reg64,
+                rdx: win_regs.values[WinStandardRegIndex::Rdx as usize].Reg64,
+
+                rsi: win_regs.values[WinStandardRegIndex::Rsi as usize].Reg64,
+                rdi: win_regs.values[WinStandardRegIndex::Rdi as usize].Reg64,
+                rsp: win_regs.values[WinStandardRegIndex::Rsp as usize].Reg64,
+                rbp: win_regs.values[WinStandardRegIndex::Rbp as usize].Reg64,
+
+                r8: win_regs.values[WinStandardRegIndex::R8 as usize].Reg64,
+                r9: win_regs.values[WinStandardRegIndex::R9 as usize].Reg64,
+                r10: win_regs.values[WinStandardRegIndex::R10 as usize].Reg64,
+                r11: win_regs.values[WinStandardRegIndex::R11 as usize].Reg64,
+                r12: win_regs.values[WinStandardRegIndex::R12 as usize].Reg64,
+                r13: win_regs.values[WinStandardRegIndex::R13 as usize].Reg64,
+                r14: win_regs.values[WinStandardRegIndex::R14 as usize].Reg64,
+                r15: win_regs.values[WinStandardRegIndex::R15 as usize].Reg64,
+
+                rip: win_regs.values[WinStandardRegIndex::Rip as usize].Reg64,
+                rflags: win_regs.values[WinStandardRegIndex::Rflags as usize].Reg64,
             })
         }
     }
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     fn set_regs(&self, regs: &StandardRegisters) -> Result<(), io::Error> {
-        //let mut regs: WHvStandardRegisterMapping = Default::default();
-        /*
-        let reg_values: [WHV_REGISTER_VALUE; 18] = [
-            WHV_REGISTER_VALUE { Reg64: regs.rax },    // 0: Rax
-            WHV_REGISTER_VALUE { Reg64: regs.rbx },    // 1: Rbx
-            WHV_REGISTER_VALUE { Reg64: regs.rcx },    // 2: Rcx
-            WHV_REGISTER_VALUE { Reg64: regs.rdx },    // 3: Rdx
-            WHV_REGISTER_VALUE { Reg64: regs.rsi },    // 4: Rsi
-            WHV_REGISTER_VALUE { Reg64: regs.rdi },    // 5: Rdi
-            WHV_REGISTER_VALUE { Reg64: regs.rsp },    // 6: Rsp
-            WHV_REGISTER_VALUE { Reg64: regs.rbp },    // 7: Rbp
-            WHV_REGISTER_VALUE { Reg64: regs.r8 },     // 8: R8
-            WHV_REGISTER_VALUE { Reg64: regs.r9 },     // 9: R9
-            WHV_REGISTER_VALUE { Reg64: regs.r10 },    // 10: R10
-            WHV_REGISTER_VALUE { Reg64: regs.r11 },    // 11: R11
-            WHV_REGISTER_VALUE { Reg64: regs.r12 },    // 12: R12
-            WHV_REGISTER_VALUE { Reg64: regs.r13 },    // 13: R13
-            WHV_REGISTER_VALUE { Reg64: regs.r14 },    // 14: R14
-            WHV_REGISTER_VALUE { Reg64: regs.r15 },    // 15: R15
-            WHV_REGISTER_VALUE { Reg64: regs.rip },    // 16: Rip
-            WHV_REGISTER_VALUE { Reg64: regs.rflags }, // 17: Rflags
-        ];
+        let mut win_regs: WinStandardRegisters = Default::default();
 
-        self.set_registers(&reg_names, &reg_values)
+        win_regs.values[WinStandardRegIndex::Rax as usize].Reg64 = regs.rax;
+        win_regs.values[WinStandardRegIndex::Rbx as usize].Reg64 = regs.rbx;
+        win_regs.values[WinStandardRegIndex::Rcx as usize].Reg64 = regs.rcx;
+        win_regs.values[WinStandardRegIndex::Rdx as usize].Reg64 = regs.rdx;
+
+        win_regs.values[WinStandardRegIndex::Rsi as usize].Reg64 = regs.rsi;
+        win_regs.values[WinStandardRegIndex::Rdi as usize].Reg64 = regs.rdi;
+        win_regs.values[WinStandardRegIndex::Rsp as usize].Reg64 = regs.rsp;
+        win_regs.values[WinStandardRegIndex::Rbp as usize].Reg64 = regs.rbp;
+
+        win_regs.values[WinStandardRegIndex::R8 as usize].Reg64 = regs.r8;
+        win_regs.values[WinStandardRegIndex::R9 as usize].Reg64 = regs.r9;
+        win_regs.values[WinStandardRegIndex::R10 as usize].Reg64 = regs.r10;
+        win_regs.values[WinStandardRegIndex::R11 as usize].Reg64 = regs.r11;
+        win_regs.values[WinStandardRegIndex::R12 as usize].Reg64 = regs.r12;
+        win_regs.values[WinStandardRegIndex::R13 as usize].Reg64 = regs.r13;
+        win_regs.values[WinStandardRegIndex::R14 as usize].Reg64 = regs.r14;
+        win_regs.values[WinStandardRegIndex::R15 as usize].Reg64 = regs.r15;
+
+        win_regs.values[WinStandardRegIndex::Rip as usize].Reg64 = regs.rip;
+        win_regs.values[WinStandardRegIndex::Rflags as usize].Reg64 = regs.rflags;
+
+        self.set_registers(&win_regs.names, &win_regs.values)
             .map_err(|_| io::Error::last_os_error())?;
-            */
 
         Ok(())
     }
 
     fn set_sregs(&self, sregs: &SpecialRegisters) -> Result<(), io::Error> {
-        let reg_names: [WHV_REGISTER_NAME; 17] = [
-            WHV_REGISTER_NAME::WHvX64RegisterCs,   // 0
-            WHV_REGISTER_NAME::WHvX64RegisterDs,   // 1
-            WHV_REGISTER_NAME::WHvX64RegisterEs,   // 2
-            WHV_REGISTER_NAME::WHvX64RegisterFs,   // 3
-            WHV_REGISTER_NAME::WHvX64RegisterGs,   // 4
-            WHV_REGISTER_NAME::WHvX64RegisterSs,   // 5
-            WHV_REGISTER_NAME::WHvX64RegisterTr,   // 6
-            WHV_REGISTER_NAME::WHvX64RegisterLdtr, // 7
-            WHV_REGISTER_NAME::WHvX64RegisterGdtr, // 8
-            WHV_REGISTER_NAME::WHvX64RegisterIdtr, // 9
-            WHV_REGISTER_NAME::WHvX64RegisterCr0,  // 10
-            WHV_REGISTER_NAME::WHvX64RegisterCr2,  // 11
-            WHV_REGISTER_NAME::WHvX64RegisterCr3,  // 12
-            WHV_REGISTER_NAME::WHvX64RegisterCr4,  // 13
-            WHV_REGISTER_NAME::WHvX64RegisterCr8,  // 14
-            WHV_REGISTER_NAME::WHvX64RegisterEfer, // 15
-            WHV_REGISTER_NAME::WHvX64RegisterApicBase, // 16
-    //            WHV_REGISTER_NAME::WHvRegisterPendingInterruption, // 17
-        ];
-        let reg_values: [WHV_REGISTER_VALUE; 17] = [
-            WHV_REGISTER_VALUE {
-                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.cs),
-            }, // 0: Cs
-            WHV_REGISTER_VALUE {
-                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.ds),
-            }, // 1: Ds
-            WHV_REGISTER_VALUE {
-                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.es),
-            }, // 2: Es
-            WHV_REGISTER_VALUE {
-                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.fs),
-            }, // 3: Fs
-            WHV_REGISTER_VALUE {
-                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.gs),
-            }, // 4: Gs
-            WHV_REGISTER_VALUE {
-                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.ss),
-            }, // 5: Ss
-            WHV_REGISTER_VALUE {
-                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.tr),
-            }, // 6: Tr
-            WHV_REGISTER_VALUE {
-                Segment: WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.ldt),
-            }, // 7: Ldtr
-            WHV_REGISTER_VALUE {
-                Table: WHV_X64_TABLE_REGISTER::from_portable(&sregs.gdt),
-            }, // 8: Gdtr
-            WHV_REGISTER_VALUE {
-                Table: WHV_X64_TABLE_REGISTER::from_portable(&sregs.idt),
-            }, // 9: Idtr
-            WHV_REGISTER_VALUE { Reg64: sregs.cr0 }, // 10: Cr0
-            WHV_REGISTER_VALUE { Reg64: sregs.cr2 }, // 11: Cr2
-            WHV_REGISTER_VALUE { Reg64: sregs.cr3 }, // 12: Cr3
-            WHV_REGISTER_VALUE { Reg64: sregs.cr4 }, // 13: Cr4
-            WHV_REGISTER_VALUE { Reg64: sregs.cr8 }, // 14: Cr8
-            WHV_REGISTER_VALUE { Reg64: sregs.efer }, // 15: Efer
-            WHV_REGISTER_VALUE {
-                Reg64: sregs.apic_base,
-            }, // 16: ApicBase
-                                                     //            WHV_REGISTER_VALUE { Reg64: Default::default() }, // 17: PendingInterruption
-        ];
+        let mut win_sregs: WinSpecialRegisters = Default::default();
+        win_sregs.values[WinSpecialRegIndex::Cs as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.cs);
 
-        self.set_registers(&reg_names, &reg_values)
+        win_sregs.values[WinSpecialRegIndex::Ds as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.ds);
+
+        win_sregs.values[WinSpecialRegIndex::Es as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.es);
+
+        win_sregs.values[WinSpecialRegIndex::Fs as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.fs);
+
+        win_sregs.values[WinSpecialRegIndex::Gs as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.gs);
+
+        win_sregs.values[WinSpecialRegIndex::Ss as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.ss);
+
+        win_sregs.values[WinSpecialRegIndex::Tr as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.tr);
+
+        win_sregs.values[WinSpecialRegIndex::Ldt as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.ldt);
+
+        win_sregs.values[WinSpecialRegIndex::Gdt as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.gdt);
+
+        win_sregs.values[WinSpecialRegIndex::Idt as usize].Segment =
+            WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.idt);
+
+        win_sregs.values[WinStandardRegIndex::Cr0 as usize].Reg64 = sregs.cr0;
+        win_sregs.values[WinStandardRegIndex::Cr2 as usize].Reg64 = sregs.cr2;
+        win_sregs.values[WinStandardRegIndex::Cr3 as usize].Reg64 = sregs.cr3;
+        win_sregs.values[WinStandardRegIndex::Cr4 as usize].Reg64 = sregs.cr4;
+        win_sregs.values[WinStandardRegIndex::Cr8 as usize].Reg64 = sregs.cr8;
+        win_sregs.values[WinStandardRegIndex::Efer as usize].Reg64 = sregs.Efer;
+        win_sregs.values[WinStandardRegIndex::ApicBase as usize].Reg64 = sregs.ApicBase;
+
+        self.set_registers(&win_sregs.names, &win_sregs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
@@ -443,7 +462,7 @@ impl Vcpu for VirtualProcessor {
                     VcpuExit::UnsupportedFeature
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64InterruptWindow => {
-                    VcpuExit::InterruptWindow
+                    VcpuExit::IrqWindowOpen
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => VcpuExit::Hlt,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => VcpuExit::IoapicEoi,
@@ -457,9 +476,7 @@ impl Vcpu for VirtualProcessor {
     }
 
     fn get_lapic(&self) -> Result<LapicState, io::Error> {
-        let mut state: LapicState = Default::default();
-
-        state = self.get_lapic_state()
+        let state: LapicState = self.get_lapic_state()
                     .map_err(|_| io::Error::last_os_error())?;
         Ok(state)
     }
@@ -527,22 +544,60 @@ impl Vcpu for VirtualProcessor {
     }
 }
 
-/*
-pub struct WhpVcpu {
-    partition: Rc<RefCell<PartitionHandle>>,
-    index: UINT32,
-    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Drop for WhpVcpu{
-    fn drop(&mut self) {
-        check_result(unsafe {
-            WHvDeleteVirtualProcessor(*self.partition.borrow_mut().handle(), self.index)
-        })
+    fn setup_vcpu_test(p: &mut Partition) {
+        let mut property: WHV_PARTITION_PROPERTY = Default::default();
+        property.ProcessorCount = 1;
+
+        p.set_property(
+            WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeProcessorCount,
+            &property,
+        )
         .unwrap();
+        p.setup().unwrap();
+    }
+
+    #[test]
+    fn test_set_get_vcpu_regs() {
+        let mut p: Partition = Partition::new().unwrap();
+        setup_vcpu_test(&mut p);
+
+        let vp_index: UINT32 = 0;
+        let vp = p.create_virtual_processor(vp_index).unwrap();
+
+        let std_regs_in = StandardRegisters {
+            rax: 5,
+            rbx: 6,
+            rcx: 7,
+            rdx: 8,
+            rsi: 9,
+            rdi: 10,
+            rsp: 11,
+            rbp: 12,
+            r8: 13,
+            r9: 14,
+            r10: 15,
+            r11: 16,
+            r12: 17,
+            r13: 18,
+            r14: 19,
+            r15: 20,
+            rip: 0xabcdabcd,
+            rflags: 0x4,
+        };
+
+        vp.set_regs(&std_regs_in).unwrap();
+        let std_regs_out = vp.get_regs().unwrap();
+
+        assert_eq!(
+            std_regs_in, std_regs_out,
+            "Register values set and gotten do not match"
+        );
     }
 }
-*/
 
 /*
 #[cfg(test)]

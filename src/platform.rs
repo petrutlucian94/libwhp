@@ -159,7 +159,7 @@ impl Partition {
     }
 
     pub fn create_virtual_processor(&self, index: UINT32) -> Result<VirtualProcessor, WHPError> {
-        let mut exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
+        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
 
         check_result(unsafe {
             WHvCreateVirtualProcessor(*self.partition.borrow_mut().handle(), index, 0)
@@ -632,8 +632,8 @@ mod tests {
         setup_vcpu_test(&mut p);
 
         let vp_index: UINT32 = 0;
-        let mut vp = p.create_virtual_processor(vp_index).unwrap();
-        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = vp.run().unwrap();
+        let vp = p.create_virtual_processor(vp_index).unwrap();
+        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = vp.do_run().unwrap();
 
         assert_eq!(
             exit_context.ExitReason,
@@ -653,13 +653,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_set_get_virtual_processor_registers() {
         let mut p: Partition = Partition::new().unwrap();
         setup_vcpu_test(&mut p);
 
         let vp_index: UINT32 = 0;
-        let mut vp = p.create_virtual_processor(vp_index).unwrap();
+        let vp = p.create_virtual_processor(vp_index).unwrap();
 
         const NUM_REGS: UINT32 = 1;
         const REG_VALUE: UINT64 = 11111111;
@@ -845,14 +844,14 @@ mod tests {
         let vp = p.create_virtual_processor(vp_index).unwrap();
 
         if apic_enabled == true {
-            let state: LapicState = vp.get_lapic().unwrap();
+            let state: LapicState = vp.get_lapic_state().unwrap();
             let icr0 = get_lapic_reg(&state, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0);
 
             // Uses both get_lapic and set_lapic under the hood
             set_reg_in_lapic(&vp, APIC_REG_OFFSET::InterruptCommand0, 0x40);
 
-            let state_out: LapicState = vp.get_lapic().unwrap();
+            let state_out: LapicState = vp.get_lapic_state().unwrap();
             let icr0 = get_lapic_reg(&state_out, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0x40);
         }
