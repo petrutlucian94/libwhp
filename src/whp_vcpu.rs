@@ -21,9 +21,11 @@ pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 
 use platform::{Partition, VirtualProcessor};
-use vmm_vcpu::vcpu::{Vcpu, VcpuExit};
+use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
 use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
                        LapicState, CpuId};
+
+
 impl Vcpu for VirtualProcessor {
 
     type RunContextType = WHV_RUN_VP_EXIT_CONTEXT;
@@ -33,7 +35,7 @@ impl Vcpu for VirtualProcessor {
     }
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-    fn get_regs(&self) -> Result<StandardRegisters, io::Error> {
+    fn get_regs(&self) -> VcpuResult<StandardRegisters> {
         let mut win_regs: WinStandardRegisters = Default::default();
 
         self.get_registers(&win_regs.names, &mut win_regs.values)
@@ -67,7 +69,7 @@ impl Vcpu for VirtualProcessor {
     }
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-    fn set_regs(&self, regs: &StandardRegisters) -> Result<(), io::Error> {
+    fn set_regs(&self, regs: &StandardRegisters) -> VcpuResult<()> {
         let mut win_regs: WinStandardRegisters = Default::default();
 
         win_regs.values[WinStandardRegIndex::Rax as usize].Reg64 = regs.rax;
@@ -98,7 +100,7 @@ impl Vcpu for VirtualProcessor {
         Ok(())
     }
 
-    fn get_sregs(&self) -> Result<SpecialRegisters, io::Error> {
+    fn get_sregs(&self) -> VcpuResult<SpecialRegisters> {
         let mut win_sregs: WinSpecialRegisters = Default::default();
 
         self.get_registers(&win_sregs.names, &mut win_sregs.values)
@@ -134,7 +136,7 @@ impl Vcpu for VirtualProcessor {
         }
     }
 
-    fn set_sregs(&self, sregs: &SpecialRegisters) -> Result<(), io::Error> {
+    fn set_sregs(&self, sregs: &SpecialRegisters) -> VcpuResult<()> {
         let mut win_sregs: WinSpecialRegisters = Default::default();
         win_sregs.values[WinSpecialRegIndex::Cs as usize].Segment =
             WHV_X64_SEGMENT_REGISTER::from_portable(&sregs.cs);
@@ -180,49 +182,20 @@ impl Vcpu for VirtualProcessor {
         Ok(())
     }
 
-    fn get_fpu(&self) -> Result<FpuState, io::Error>{
+    fn get_fpu(&self) -> VcpuResult<FpuState>{
         let mut fregs: WinFpuRegisters = Default::default();
 
+        // Get the registers from the vCPU
         self.get_registers(&fregs.names, &mut fregs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
-        let mut fpu: FpuState = Default::default();
+        // Perform the conversion from these fields to FpuState fields
+        let mut fpu_state: FpuState = ConvertFpuState::to_portable(&fregs);
 
-        // Add the fields from the FP Control Status Register
-        let fcs_reg: WHV_X64_FP_CONTROL_STATUS_REGISTER;
-        unsafe {
-            fcs_reg = fregs.values[WinFpRegIndex::Fcs as usize].FpControlStatus;
-        };
-        fcs_reg.add_fields_to_state(&mut fpu);
-
-        // Add the fields from the XMM Control Status Register
-        let xcs_reg: WHV_X64_XMM_CONTROL_STATUS_REGISTER;
-        unsafe {
-            xcs_reg = fregs.values[WinFpRegIndex::Xcs as usize].XmmControlStatus;
-        };
-        xcs_reg.add_fields_to_state(&mut fpu);
-
-        // Add the 16 XMM Regs
-        for idx in 0..16 {
-            // TODO: Add these
-        }
-        // Add the 7 FP MMX Regs
-        //gdt: win_sregs.values[WinSpecialRegIndex::Gdt as usize].Table.to_portable(),
-
-        /*
-        unsafe {
-            Ok(FpuState {
-                fcw: reg_values[0].Reg64 as UINT16,
-                mxcsr: reg_values[1].Reg64 as UINT32,
-                fpr[0]: reg_values[2].Reg
-            })
-        }
-        */
-
-        Ok(fpu)
+        Ok(fpu_state)
     }
 
-    fn set_fpu(&self, fpu: &FpuState) -> Result<(), io::Error> {
+    fn set_fpu(&self, fpu: &FpuState) -> VcpuResult<()> {
         let reg_names: [WHV_REGISTER_NAME; 4] = [
             WHV_REGISTER_NAME::WHvX64RegisterFpControlStatus,
             WHV_REGISTER_NAME::WHvX64RegisterXmmControlStatus,
@@ -257,16 +230,31 @@ impl Vcpu for VirtualProcessor {
     /// per the specification, each leaf is either set, cleared, or passed-through
     /// from hardware) and cannot be configured.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn set_cpuid2(&self, _cpuid: &CpuId) -> Result<(), io::Error> {
+    fn set_cpuid2(&self, _cpuid: &CpuId) -> VcpuResult<()> {
+        /// Given the CpuId vector:
+        /// - Get the length and create a Vec of CPUID_RESULTs of that size:
+        /// 
+        ///   let mut cpuid_results: [libwhp::WHV_X64_CPUID_RESULT; 1] = Default::default();
+        /// 
+        /// - Copy the Function from the CpuId entry to the cpuid_results[idx].Function
+        /// 
+        /// - Copy the register values from the CpuId entry  
+        /// 
+        /// - Set property: partition.set_property_cpuid_results(0)
+        /// 
+        /// - Uh oh, this is a VM (partition)-level operation, not a VCPU-level
+        ///   operation. Grab the partition and perform the operation: 
+        /// 
+        ///   self.parition.borrow_mut().handle().set_property_cpuid_results();
         unimplemented!();
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn get_msrs(&self, _msrs: &mut MsrEntries) -> Result<i32, io::Error> {
+    fn get_msrs(&self, _msrs: &mut MsrEntries) -> VcpuResult<i32> {
         Ok(0)
     }
 
-    fn set_msrs(&self, _msrs: &MsrEntries) -> Result<(), io::Error> {
+    fn set_msrs(&self, _msrs: &MsrEntries) -> VcpuResult<()> {
         // Need to create a mapping between arch_gen indices of MSRs and the
         // MSRs that WHV exposes. Each mapping will consist of a tuple of
         // the MSR index and the WHV register name. Non-supported MSRs should
@@ -277,12 +265,13 @@ impl Vcpu for VirtualProcessor {
         println!("In WHP set_msrs");
         Ok(())
     }
-    fn run(&self) -> Result<VcpuExit, io::Error> {
+
+    fn run(&self) -> VcpuResult<VcpuExit> {
         let exit_context: WHV_RUN_VP_EXIT_CONTEXT = self.do_run().unwrap();
 
         let exit_reason = 
             match exit_context.ExitReason {
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::Unknown,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::None,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => VcpuExit::MemoryAccess,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => VcpuExit::IoPortAccess,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnrecoverableException => {
@@ -308,19 +297,18 @@ impl Vcpu for VirtualProcessor {
         Ok(exit_reason)
     }
 
-    fn get_lapic(&self) -> Result<LapicState, io::Error> {
+    fn get_lapic(&self) -> VcpuResult<LapicState> {
         let state: LapicState = self.get_lapic_state()
                     .map_err(|_| io::Error::last_os_error())?;
         Ok(state)
     }
 
-    fn set_lapic(&self, klapic: &LapicState) -> Result<(), io::Error> {
+    fn set_lapic(&self, klapic: &LapicState) -> VcpuResult<()> {
         self.set_lapic_state(klapic)
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
     }
-
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 // License for the specific language governing permissions and limitations
 // under the License.
+use std::mem;
 
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
@@ -22,7 +23,8 @@ use vmm_vcpu::x86_64::{FpuState, SegmentRegister, DescriptorTable};
 
 ///
 /// Enumerate the index at which each register will be stored within the
-/// WinStandardRegisters
+/// WinStandardRegisters so that we can get/set both WHV_REGISTER_NAMES and
+/// WHV_REGISTER_VALUES with the same enum
 /// 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -253,6 +255,63 @@ impl Default for WinFpuRegisters {
     }
 }
 
+pub trait ConvertFpuState {
+    fn to_portable(from: &Self) -> FpuState;
+    fn from_portable(fpu_state: &FpuState) -> Self;
+}
+
+impl ConvertFpuState for WinFpuRegisters {
+    fn to_portable(from: &Self) -> FpuState {
+        // Perform the conversion from these fields to FpuState fields
+        let mut fpu_state: FpuState = Default::default();
+
+        // Add the fields from the FP Control Status Register
+        let fcs_reg: WHV_X64_FP_CONTROL_STATUS_REGISTER;
+        unsafe {
+            fcs_reg = from.values[WinFpRegIndex::Fcs as usize].FpControlStatus;
+        };
+        fcs_reg.add_fields_to_state(&mut fpu_state);
+
+        // Add the fields from the XMM Control Status Register
+        let xcs_reg: WHV_X64_XMM_CONTROL_STATUS_REGISTER;
+        unsafe {
+            xcs_reg = from.values[WinFpRegIndex::Xcs as usize].XmmControlStatus;
+        };
+        xcs_reg.add_fields_to_state(&mut fpu_state);
+
+        // Add the 16 XMM Regs
+        for idx in 0..16 {
+            let from_idx = WinFpRegIndex::Xmm0 as usize + idx;
+            unsafe {
+                fpu_state.fpr[idx] = WHV_UINT128::to_u8_array(&from.values[from_idx].Reg128);
+            }
+        }
+
+        // Add the 8 MMX Regs
+        for idx in 0..8 {
+            let from_idx = WinFpRegIndex::FpMmx0 as usize + idx;
+            unsafe {
+                fpu_state.fpr[idx] = WHV_UINT128::to_u8_array(&from.values[from_idx].Reg128);
+            }
+        }
+
+        fpu_state
+    }
+
+    fn from_portable(fpu_state: &FpuState) -> Self {
+        let mut fregs: WinFpuRegisters = Default::default();
+
+        unsafe {
+            // Fill in the fields of the FP Control Status Register from the FpuState
+            let mut fcs_reg = fregs.values[WinFpRegIndex::Fcs as usize].FpControlStatus;
+            fcs_reg.extract_fields_from_state(fpu_state);
+        };
+
+        fregs
+    }
+}
+
+
 ///
 /// Trait to convert between a FpControlStatusRegister and the FpuState
 /// structure
@@ -287,6 +346,7 @@ impl ConvertFpControlStatusRegister for WHV_X64_FP_CONTROL_STATUS_REGISTER {
         };
     }
 }
+
 
 ///
 /// Trait to convert between an Xmm pControlStatusRegister and the FpuState
@@ -386,46 +446,146 @@ impl ConvertDescriptorTable for WHV_X64_TABLE_REGISTER {
 /// Trait to convert between a UINT128 and an array of UINT8s
 /// 
 pub trait ConvertUint128{
-    fn to_u8_array(&self) -> [u8; 16usize];
+    fn to_u8_array(uint128: &Self) -> [u8; 16usize];
     fn from_u8_array(from: &[u8; 16usize]) -> Self;
 }
 
 impl ConvertUint128 for WHV_UINT128 {
-    fn to_u8_array(&self) -> [u8; 16usize] {
+    fn to_u8_array(uint128: &Self) -> [u8; 16usize] {
         let mut array: [u8; 16usize] = Default::default();
+        let src = uint128 as *const WHV_UINT128 as *const u8;
+        let mut dst = array.as_mut_ptr();
 
-        // Store the high bytes by shifting to put the bits in the LSB position
-        // idx runs from 7..0, but we'll put them in the 15..8 slots
-        for idx in (0..8).rev() {
-            array[idx + 8] = (self.High64 >> (idx * 8)) as u8;
-        }
+        let dst_len = array.len();
 
-        // Store the low bytes by shifting to put the bits in the LSB position
-        // idx runs from 7..0, and we'll put them in the 7..0 slots
-        for idx in (0..8).rev() {
-            array[idx] = (self.Low64 >> (idx * 8)) as u8;
+        // Safe because we know the two structures are nonoverlapping and the
+        // same size (8 * 16 = 128 bytes)
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, dst, dst_len);
         }
 
         array
     }
 
-    fn from_u8_array(from: &[u8; 16usize]) -> Self {
+    fn from_u8_array(array: &[u8; 16usize]) -> Self {
         let mut uint128: WHV_UINT128 = Default::default();
 
-        // Store the high bytes by ANDing with the shifted bits
-        // idx runs from 7..0, but we'll take from the top 15..0 entries
-        for idx in (0..8).rev() {
-            uint128.High64 |= (from[idx + 8]  << (idx * 8)) as u64;
-        }
+        let src = array.as_ptr();
+        let mut dst = &mut uint128 as *mut WHV_UINT128 as *mut u8;
 
-        // Store the low bytes by ANDing with the shifted bits
-        // idx runs from 7..0, and we'll take from the 7..0 entries
-        for idx in (0..8).rev() {
-            uint128.Low64 |= (from[idx]  << (idx * 8)) as u64;
+        let dst_len = array.len();
+
+        // Safe because we know the two structures are nonoverlapping and the same
+        // size (8 * 16 = 128 bytes)
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, dst, dst_len);
         }
 
         uint128
     }
-    // TODO: Write tests
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_convert_uint128_to_array() {
+        let mut uint128_val: WHV_UINT128 = Default::default();
+        uint128_val.Low64 = 0xbbbb_aaaa_9999_8888;
+        uint128_val.High64 = 0xffff_eeee_dddd_cccc;
+
+        // Convert from UINT128 to array of bytes
+        //let array_of_bytes = convert_uint128_to_array(uint128_val).unwrap();
+        let array_of_bytes = WHV_UINT128::to_u8_array(&uint128_val);
+
+        // Assert on the MSB being correct
+        assert_eq!(
+            array_of_bytes[15],
+            (uint128_val.High64 >> 56) as u8,
+            "Failure to convert UINT128 to array");
+
+        // Assert on the LSB being correct
+        assert_eq!(
+            array_of_bytes[0],
+            (uint128_val.Low64 & 0xff) as u8,
+            "Failure to convert UINT128 to array");
+
+        // Convert array of bytes back to UINT128
+        //let uint128_out = convert_array_to_uint128(array_of_bytes).unwrap();
+        let uint128_out = WHV_UINT128::from_u8_array(&array_of_bytes);
+        assert_eq!(
+            uint128_val, 
+            uint128_out, 
+            "Conversion between UINT128 and array of bytes failed");
+    }
+    
+    #[test]
+    fn test_win_standard_regs() {
+        let regs_in: WinStandardRegisters = Default::default();
+
+        // Test that a few of the names are set correctly
+        assert_eq!(
+            regs_in.names[WinStandardRegIndex::Rax as usize], 
+            WHV_REGISTER_NAME::WHvX64RegisterRax,
+            "StandardRegister not initialized correctly");
+        assert_eq!(
+            regs_in.names[WinStandardRegIndex::Rbx as usize], 
+            WHV_REGISTER_NAME::WHvX64RegisterRbx,
+            "StandardRegister not initialized correctly");
+        assert_eq!(
+            regs_in.names[WinStandardRegIndex::R8 as usize], 
+            WHV_REGISTER_NAME::WHvX64RegisterR8,
+            "StandardRegister not initialized correctly");
+        assert_eq!(
+            regs_in.names[WinStandardRegIndex::Rflags as usize], 
+            WHV_REGISTER_NAME::WHvX64RegisterRflags,
+            "StandardRegister not initialized correctly");
+    }
+
+    #[test]
+    fn test_win_special_regs() {
+        let regs_in: WinSpecialRegisters = Default::default();
+
+        // Test that a few of the names are set correctly
+        assert_eq!(
+            regs_in.names[WinSpecialRegIndex::Cs as usize], 
+            WHV_REGISTER_NAME::WHvX64RegisterCs,
+            "SpecialRegister not initialized correctly");
+        assert_eq!(
+            regs_in.names[WinSpecialRegIndex::Ldt as usize], 
+            WHV_REGISTER_NAME::WHvX64RegisterLdtr,
+            "SpecialRegister not initialized correctly");
+        assert_eq!(
+            regs_in.names[WinSpecialRegIndex::ApicBase as usize], 
+            WHV_REGISTER_NAME::WHvX64RegisterApicBase,
+            "SpecialRegister not initialized correctly");
+    }
+
+    #[test]
+    fn test_convert_fp_control_status_reg() {
+        let mut fpu_state_in: FpuState = Default::default();
+        
+        fpu_state_in.fcw = 0x37f;
+        fpu_state_in.fsw = 0xabc;
+        fpu_state_in.ftwx = 0xde;
+        fpu_state_in.last_opcode = 0xcafe;
+        fpu_state_in.last_ip = 0x1111_2222_3333_4444;
+        fpu_state_in.last_dp = 0x5555_6666_7777_8888;
+        fpu_state_in.mxcsr = 0x9999_aaaa;
+
+        let mut fregs: WHV_X64_FP_CONTROL_STATUS_REGISTER = Default::default();
+        let mut xregs: WHV_X64_XMM_CONTROL_STATUS_REGISTER = Default::default();
+
+        // Populate the WinFpuRegisters with values from FpuState
+        fregs.extract_fields_from_state(&fpu_state_in);
+        xregs.extract_fields_from_state(&fpu_state_in);
+
+        let mut fpu_state_out: FpuState = Default::default();
+
+        fregs.add_fields_to_state(&mut fpu_state_out);
+        xregs.add_fields_to_state(&mut fpu_state_out);
+
+        assert_eq!(fpu_state_in, fpu_state_out, "FP Control Status Register conversion failed");
+    }
+}
