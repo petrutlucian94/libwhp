@@ -19,7 +19,9 @@ pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 
 use vmm_vcpu::x86_64::{FpuState, SegmentRegister, DescriptorTable};
-//use vmm_vcpu::vcpu::Result as VcpuResult;
+
+const NUM_XMM_REGS: usize = 16;
+const NUM_FPMMX_REGS: usize = 8;
 
 ///
 /// Enumerate the index at which each register will be stored within the
@@ -265,30 +267,33 @@ impl ConvertFpuState for WinFpuRegisters {
         // Perform the conversion from these fields to FpuState fields
         let mut fpu_state: FpuState = Default::default();
 
-        // Add the fields from the FP Control Status Register
-        let fcs_reg: WHV_X64_FP_CONTROL_STATUS_REGISTER;
         unsafe {
-            fcs_reg = from.values[WinFpRegIndex::Fcs as usize].FpControlStatus;
-        };
-        fcs_reg.add_fields_to_state(&mut fpu_state);
+            // Add the fields from the FP Control Status Register to the FPU State
+            let fcs_reg = from.values[WinFpRegIndex::Fcs as usize].FpControlStatus;
 
-        // Add the fields from the XMM Control Status Register
-        let xcs_reg: WHV_X64_XMM_CONTROL_STATUS_REGISTER;
-        unsafe {
-            xcs_reg = from.values[WinFpRegIndex::Xcs as usize].XmmControlStatus;
-        };
-        xcs_reg.add_fields_to_state(&mut fpu_state);
+            fpu_state.fcw = fcs_reg.anon_struct.FpControl;
+            fpu_state.fsw = fcs_reg.anon_struct.FpStatus;
+            fpu_state.ftwx = fcs_reg.anon_struct.FpTag;
+            fpu_state.last_opcode = fcs_reg.anon_struct.LastFpOp;
+            fpu_state.last_ip = fcs_reg.anon_struct.anon_union.LastFpRip;
 
-        // Add the 16 XMM Regs
-        for idx in 0..16 {
+            // Add the fields from the XMM Control Status Register to the FPU State
+            let xcs_reg = from.values[WinFpRegIndex::Xcs as usize].XmmControlStatus;
+
+            fpu_state.last_dp = xcs_reg.anon_struct.anon_union.LastFpRdp;
+            fpu_state.mxcsr = xcs_reg.anon_struct.XmmStatusControl;
+        }
+
+        // Add the 16 XMM Regs to the FPU State
+        for idx in 0..NUM_XMM_REGS {
             let from_idx = WinFpRegIndex::Xmm0 as usize + idx;
             unsafe {
-                fpu_state.fpr[idx] = WHV_UINT128::to_u8_array(&from.values[from_idx].Reg128);
+                fpu_state.xmm[idx] = WHV_UINT128::to_u8_array(&from.values[from_idx].Reg128);
             }
         }
 
-        // Add the 8 MMX Regs
-        for idx in 0..8 {
+        // Add the 8 FP MMX Regs to the FPU State
+        for idx in 0..NUM_FPMMX_REGS {
             let from_idx = WinFpRegIndex::FpMmx0 as usize + idx;
             unsafe {
                 fpu_state.fpr[idx] = WHV_UINT128::to_u8_array(&from.values[from_idx].Reg128);
@@ -303,77 +308,40 @@ impl ConvertFpuState for WinFpuRegisters {
 
         unsafe {
             // Fill in the fields of the FP Control Status Register from the FpuState
-            let mut fcs_reg = fregs.values[WinFpRegIndex::Fcs as usize].FpControlStatus;
-            fcs_reg.extract_fields_from_state(fpu_state);
+
+            let mut fcs_reg: WHV_X64_FP_CONTROL_STATUS_REGISTER = Default::default();
+
+            fcs_reg.anon_struct.FpControl = fpu_state.fcw;
+            fcs_reg.anon_struct.FpStatus = fpu_state.fsw;
+            fcs_reg.anon_struct.FpTag = fpu_state.ftwx;
+            fcs_reg.anon_struct.LastFpOp = fpu_state.last_opcode;
+            fcs_reg.anon_struct.anon_union.LastFpRip = fpu_state.last_ip;
+
+            fregs.values[WinFpRegIndex::Fcs as usize].FpControlStatus = fcs_reg;
+
+            // Fill in the fields of the XMM Control Status Register from the FpuState
+            let mut xcs_reg: WHV_X64_XMM_CONTROL_STATUS_REGISTER = Default::default();
+
+            xcs_reg.anon_struct.anon_union.LastFpRdp = fpu_state.last_dp;
+            xcs_reg.anon_struct.XmmStatusControl = fpu_state.mxcsr;
+            xcs_reg.anon_struct.XmmStatusControlMask = 0xffff;
+
+            fregs.values[WinFpRegIndex::Xcs as usize].XmmControlStatus = xcs_reg;
         };
+
+        // Add the 16 XMM Regs to the WinFpuRegisters
+        for idx in 0..NUM_XMM_REGS {
+            let to_idx = WinFpRegIndex::Xmm0 as usize + idx;
+            fregs.values[to_idx].Reg128 = WHV_UINT128::from_u8_array(&fpu_state.xmm[idx]);
+        }
+
+        // Add the 8 FP MMX Regs to the WinFpuRegisters
+        for idx in 0..NUM_FPMMX_REGS {
+            let to_idx = WinFpRegIndex::FpMmx0 as usize + idx;
+            fregs.values[to_idx].Reg128 = WHV_UINT128::from_u8_array(&fpu_state.fpr[idx]);
+        }
 
         fregs
-    }
-}
-
-
-///
-/// Trait to convert between a FpControlStatusRegister and the FpuState
-/// structure
-/// 
-pub trait ConvertFpControlStatusRegister {
-    fn add_fields_to_state(&self, fpu_state: &mut FpuState);
-    fn extract_fields_from_state(&mut self, from: &FpuState);
-}
-
-impl ConvertFpControlStatusRegister for WHV_X64_FP_CONTROL_STATUS_REGISTER {
-    //
-    // Take an existing FpuState as input and add the fields of the 
-    // FP ControlStatusRegister. x64 only.
-    //
-    fn add_fields_to_state(&self, fpu_state: &mut FpuState) {
-        unsafe {
-            fpu_state.fcw = self.anon_struct.FpControl;
-            fpu_state.fsw = self.anon_struct.FpStatus;
-            fpu_state.ftwx = self.anon_struct.FpTag;
-            fpu_state.last_opcode = self.anon_struct.LastFpOp;
-            fpu_state.last_ip = self.anon_struct.anon_union.LastFpRip;
-        };
-    }
-
-    fn extract_fields_from_state(&mut self, fpu_state: &FpuState) {
-        unsafe {
-            self.anon_struct.FpControl = fpu_state.fcw;
-            self.anon_struct.FpStatus = fpu_state.fsw;
-            self.anon_struct.FpTag = fpu_state.ftwx;
-            self.anon_struct.LastFpOp = fpu_state.last_opcode;
-            self.anon_struct.anon_union.LastFpRip = fpu_state.last_ip;
-        };
-    }
-}
-
-
-///
-/// Trait to convert between an Xmm pControlStatusRegister and the FpuState
-/// structure
-/// 
-pub trait ConvertXmmControlStatusRegister {
-    fn add_fields_to_state(&self, fpu_state: &mut FpuState);
-    fn extract_fields_from_state(&mut self, from: &FpuState);
-}
-
-impl ConvertXmmControlStatusRegister for WHV_X64_XMM_CONTROL_STATUS_REGISTER {
-    //
-    // Take an existing FpuState as input and add the fields of the 
-    // XMM ControlStatusRegister. x64 only.
-    //
-    fn add_fields_to_state(&self, fpu_state: &mut FpuState) {
-        unsafe {
-            fpu_state.last_dp = self.anon_struct.anon_union.LastFpRdp;
-            fpu_state.mxcsr = self.anon_struct.XmmStatusControl;
-        };
-    }
-
-    fn extract_fields_from_state(&mut self, fpu_state: &FpuState) {
-        unsafe {
-            self.anon_struct.anon_union.LastFpRdp = fpu_state.last_dp;
-            self.anon_struct.XmmStatusControl = fpu_state.mxcsr;
-        };
     }
 }
 
@@ -563,9 +531,10 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_fp_control_status_reg() {
+    fn test_convert_fp_state() {
         let mut fpu_state_in: FpuState = Default::default();
         
+        // Populate the control pieces
         fpu_state_in.fcw = 0x37f;
         fpu_state_in.fsw = 0xabc;
         fpu_state_in.ftwx = 0xde;
@@ -574,18 +543,68 @@ mod tests {
         fpu_state_in.last_dp = 0x5555_6666_7777_8888;
         fpu_state_in.mxcsr = 0x9999_aaaa;
 
-        let mut fregs: WHV_X64_FP_CONTROL_STATUS_REGISTER = Default::default();
-        let mut xregs: WHV_X64_XMM_CONTROL_STATUS_REGISTER = Default::default();
+        // Populate the XMM and FPMMX registers by writing to the one of the bytes
+        for idx in 0..NUM_XMM_REGS {
+            fpu_state_in.xmm[idx][0] = idx as u8;
+        }
+
+        for idx in 0..NUM_FPMMX_REGS {
+            fpu_state_in.fpr[idx][0] = idx as u8;
+        }
+
+        // Convert the FpuState into WinFpuRegisters
+        let mut fregs = WinFpuRegisters::from_portable(&fpu_state_in);
 
         // Populate the WinFpuRegisters with values from FpuState
-        fregs.extract_fields_from_state(&fpu_state_in);
-        xregs.extract_fields_from_state(&fpu_state_in);
+        unsafe {
+            let fcs_reg = fregs.values[WinFpRegIndex::Fcs as usize].FpControlStatus;
+            let xcs_reg = fregs.values[WinFpRegIndex::Xcs as usize].XmmControlStatus;
 
-        let mut fpu_state_out: FpuState = Default::default();
+            // Check the FpControlStatus fields
+            assert_eq!(fcs_reg.anon_struct.FpControl, 0x37f, "FpControl conversion failed");
+            assert_eq!(fcs_reg.anon_struct.FpStatus, 0xabc, "FpStatus conversion failed");
+            assert_eq!(fcs_reg.anon_struct.FpTag, 0xde, "FpTag conversion failed");
+            assert_eq!(fcs_reg.anon_struct.LastFpOp, 0xcafe, "LastFpOp conversion failed");
+            assert_eq!(
+                fcs_reg.anon_struct.anon_union.LastFpRip,
+                0x1111_2222_3333_4444,
+                "LastFpRip conversion failed");
 
-        fregs.add_fields_to_state(&mut fpu_state_out);
-        xregs.add_fields_to_state(&mut fpu_state_out);
+            // Check the XMMControlStatus fields
+            assert_eq!(
+                xcs_reg.anon_struct.anon_union.LastFpRdp,
+                0x5555_6666_7777_8888,
+                "LastFpRdp conversion failed");
+            assert_eq!(
+                xcs_reg.anon_struct.XmmStatusControl,
+                0x9999_aaaa,
+                "XmlStatusControl conversion failed");
+            assert_eq!(
+                xcs_reg.anon_struct.XmmStatusControlMask,
+                0xffff,
+                "XmlStatusControlMask conversion failed");
 
-        assert_eq!(fpu_state_in, fpu_state_out, "FP Control Status Register conversion failed");
+            // Check the XMM regs
+            for idx in 0..NUM_XMM_REGS {
+                let from_idx = WinFpRegIndex::Xmm0 as usize + idx;
+                assert_eq!(
+                    fregs.values[from_idx].Reg128.Low64,
+                    idx as u64,
+                    "Xmm[{}] reg conversion failed", from_idx);
+            }
+
+            // Check the FPMMX regs
+            for idx in 0..NUM_FPMMX_REGS {
+                let from_idx = WinFpRegIndex::FpMmx0 as usize + idx;
+                assert_eq!(
+                    fregs.values[from_idx].Reg128.Low64,
+                    idx as u64,
+                    "FpMmx[{}] reg conversion failed", from_idx);
+            }
+        }
+
+        let fpu_state_out = WinFpuRegisters::to_portable(&fregs);
+
+        assert_eq!(fpu_state_in, fpu_state_out, "FP conversion failed");
     }
 }

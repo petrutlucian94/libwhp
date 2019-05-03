@@ -196,31 +196,9 @@ impl Vcpu for VirtualProcessor {
     }
 
     fn set_fpu(&self, fpu: &FpuState) -> VcpuResult<()> {
-        let reg_names: [WHV_REGISTER_NAME; 4] = [
-            WHV_REGISTER_NAME::WHvX64RegisterFpControlStatus,
-            WHV_REGISTER_NAME::WHvX64RegisterXmmControlStatus,
-            WHV_REGISTER_NAME::WHvX64RegisterXmm0,
-            WHV_REGISTER_NAME::WHvX64RegisterFpMmx0,
-        ];
+        let mut fregs: WinFpuRegisters = ConvertFpuState::from_portable(&fpu);
 
-        let mut reg_values: [WHV_REGISTER_VALUE; 4] = Default::default();
-        reg_values[0].Reg64 = fpu.fcw as UINT64;
-        reg_values[1].Reg64 = fpu.mxcsr as UINT64;
-        reg_values[2].Fp = WHV_X64_FP_REGISTER {
-            AsUINT128: WHV_UINT128 {
-                Low64: 0,
-                High64: 0,
-            },
-        };
-        reg_values[3].Fp = WHV_X64_FP_REGISTER {
-            AsUINT128: WHV_UINT128 {
-                Low64: 0,
-                High64: 0,
-            },
-        };
-        println!("In WHP set_fpu");
-
-        self.set_registers(&reg_names, &reg_values)
+        self.set_registers(&fregs.names, &fregs.values)
             .map_err(|_| io::Error::last_os_error()).unwrap();
         Ok(())
     }
@@ -230,7 +208,7 @@ impl Vcpu for VirtualProcessor {
     /// per the specification, each leaf is either set, cleared, or passed-through
     /// from hardware) and cannot be configured.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn set_cpuid2(&self, _cpuid: &CpuId) -> VcpuResult<()> {
+    fn set_cpuid2(&self, cpuid: &CpuId) -> VcpuResult<()> {
         /// Given the CpuId vector:
         /// - Get the length and create a Vec of CPUID_RESULTs of that size:
         /// 
@@ -246,7 +224,11 @@ impl Vcpu for VirtualProcessor {
         ///   operation. Grab the partition and perform the operation: 
         /// 
         ///   self.parition.borrow_mut().handle().set_property_cpuid_results();
-        unimplemented!();
+        
+        let len = cpuid.len();
+        println!("CPUID len is: {}", len);
+
+        Ok(())
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -314,6 +296,7 @@ impl Vcpu for VirtualProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vmm_vcpu::x86_64::{CpuIdEntry2};
 
     fn setup_vcpu_test(p: &mut Partition) {
         let mut property: WHV_PARTITION_PROPERTY = Default::default();
@@ -397,6 +380,53 @@ mod tests {
             sregs, std_regs_out,
             "SpecialRegister values set and gotten do not match"
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_set_cpuid2() {
+        const CPUID_EXT_HYPERVISOR: UINT32 = 1 << 31;
+
+        let mut p: Partition = Partition::new().unwrap();
+        setup_vcpu_test(&mut p);
+
+        let vp_index: UINT32 = 0;
+        let vp = p.create_virtual_processor(vp_index).unwrap();
+
+        // Create a VCPU array
+        let mut cpuid = CpuId::new(0);
+        cpuid.push(CpuIdEntry2 {
+            function: 1,
+            index: 0,
+            flags: 0,
+            eax: 0,
+            ebx: 0,
+            ecx: CPUID_EXT_HYPERVISOR,
+            edx: 0,
+            padding: [0, 0, 0]
+        }).unwrap();
+
+        cpuid.push(CpuIdEntry2 {
+            function: 2,
+            index: 0,
+            flags: 0,
+            eax: 1,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            padding: [0, 0, 0]
+        }).unwrap();
+        vp.set_cpuid2(&cpuid).unwrap();
+
+        /*
+        const CPUID_EXT_HYPERVISOR: UINT32 = 1 << 31;
+        let mut p: Partition = Partition::new().unwrap();
+        let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
+        let mut cpuid_result: WHV_X64_CPUID_RESULT = Default::default();
+        cpuid_result.Function = 1;
+        cpuid_result.Ecx = CPUID_EXT_HYPERVISOR;
+        cpuid_results.push(cpuid_result);
+        */
     }
 }
 
