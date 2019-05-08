@@ -190,13 +190,13 @@ impl Vcpu for VirtualProcessor {
             .map_err(|_| io::Error::last_os_error())?;
 
         // Perform the conversion from these fields to FpuState fields
-        let mut fpu_state: FpuState = ConvertFpuState::to_portable(&fregs);
+        let fpu_state: FpuState = ConvertFpuState::to_portable(&fregs);
 
         Ok(fpu_state)
     }
 
     fn set_fpu(&self, fpu: &FpuState) -> VcpuResult<()> {
-        let mut fregs: WinFpuRegisters = ConvertFpuState::from_portable(&fpu);
+        let fregs: WinFpuRegisters = ConvertFpuState::from_portable(&fpu);
 
         self.set_registers(&fregs.names, &fregs.values)
             .map_err(|_| io::Error::last_os_error()).unwrap();
@@ -226,7 +226,20 @@ impl Vcpu for VirtualProcessor {
         ///   self.parition.borrow_mut().handle().set_property_cpuid_results();
         
         let len = cpuid.len();
-        println!("CPUID len is: {}", len);
+        let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
+
+        for entry in cpuid.as_entries_slice().iter() {
+            let mut cpuid_result: WHV_X64_CPUID_RESULT = Default::default();
+            cpuid_result.Function = entry.function;
+            cpuid_result.Eax = entry.eax;
+            cpuid_result.Ebx = entry.ebx;
+            cpuid_result.Ecx = entry.ecx;
+            cpuid_result.Edx = entry.edx;
+
+            cpuid_results.push(cpuid_result);
+        }
+
+        self.set_cpuid_results_on_partition(&cpuid_results).unwrap();
 
         Ok(())
     }
