@@ -209,25 +209,10 @@ impl Vcpu for VirtualProcessor {
     /// from hardware) and cannot be configured.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn set_cpuid2(&self, cpuid: &CpuId) -> VcpuResult<()> {
-        /// Given the CpuId vector:
-        /// - Get the length and create a Vec of CPUID_RESULTs of that size:
-        /// 
-        ///   let mut cpuid_results: [libwhp::WHV_X64_CPUID_RESULT; 1] = Default::default();
-        /// 
-        /// - Copy the Function from the CpuId entry to the cpuid_results[idx].Function
-        /// 
-        /// - Copy the register values from the CpuId entry  
-        /// 
-        /// - Set property: partition.set_property_cpuid_results(0)
-        /// 
-        /// - Uh oh, this is a VM (partition)-level operation, not a VCPU-level
-        ///   operation. Grab the partition and perform the operation: 
-        /// 
-        ///   self.parition.borrow_mut().handle().set_property_cpuid_results();
-        
         let len = cpuid.len();
         let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
 
+        // TODO: Test this
         for entry in cpuid.as_entries_slice().iter() {
             let mut cpuid_result: WHV_X64_CPUID_RESULT = Default::default();
             cpuid_result.Function = entry.function;
@@ -418,28 +403,6 @@ mod tests {
             edx: 0,
             padding: [0, 0, 0]
         }).unwrap();
-
-        cpuid.push(CpuIdEntry2 {
-            function: 2,
-            index: 0,
-            flags: 0,
-            eax: 1,
-            ebx: 0,
-            ecx: 0,
-            edx: 0,
-            padding: [0, 0, 0]
-        }).unwrap();
-        vp.set_cpuid2(&cpuid).unwrap();
-
-        /*
-        const CPUID_EXT_HYPERVISOR: UINT32 = 1 << 31;
-        let mut p: Partition = Partition::new().unwrap();
-        let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
-        let mut cpuid_result: WHV_X64_CPUID_RESULT = Default::default();
-        cpuid_result.Function = 1;
-        cpuid_result.Ecx = CPUID_EXT_HYPERVISOR;
-        cpuid_results.push(cpuid_result);
-        */
     }
 }
 
