@@ -13,14 +13,13 @@
 // License for the specific language governing permissions and limitations
 // under the License.
 
-use common::*;
 use std::io;
 pub use whp_vcpu_structs::*;
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 
-use platform::{Partition, VirtualProcessor};
+use platform::VirtualProcessor;
 use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
 use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
                        LapicState, CpuId};
@@ -209,10 +208,8 @@ impl Vcpu for VirtualProcessor {
     /// from hardware) and cannot be configured.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn set_cpuid2(&self, cpuid: &CpuId) -> VcpuResult<()> {
-        let len = cpuid.len();
         let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
 
-        // TODO: Test this
         for entry in cpuid.as_entries_slice().iter() {
             let mut cpuid_result: WHV_X64_CPUID_RESULT = Default::default();
             cpuid_result.Function = entry.function;
@@ -234,15 +231,17 @@ impl Vcpu for VirtualProcessor {
         Ok(0)
     }
 
-    fn set_msrs(&self, _msrs: &MsrEntries) -> VcpuResult<()> {
+    fn set_msrs(&self, msrs: &MsrEntries) -> VcpuResult<()> {
         // Need to create a mapping between arch_gen indices of MSRs and the
         // MSRs that WHV exposes. Each mapping will consist of a tuple of
         // the MSR index and the WHV register name. Non-supported MSRs should
         // be empty/identifiabler
 
-        let sregs: SpecialRegisters = Default::default();
-        self.set_sregs(&sregs)?;
-        println!("In WHP set_msrs");
+        let mut msr_names: Vec<WHV_REGISTER_NAME> = Vec::new();
+        let mut msr_values: Vec<WHV_REGISTER_VALUE> = Vec::new();
+
+        // TODO: Continue here. Iterate through msrs.
+
         Ok(())
     }
 

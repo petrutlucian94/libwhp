@@ -12,13 +12,16 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 // License for the specific language governing permissions and limitations
 // under the License.
-use std::mem;
+#![allow(non_snake_case)]
 
-pub use win_hv_platform_defs::*;
+pub use win_hv_platform_defs::{
+    WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_X64_TABLE_REGISTER,
+    WHV_X64_SEGMENT_REGISTER, WHV_UINT128, WHV_X64_XMM_CONTROL_STATUS_REGISTER,
+    WHV_X64_FP_CONTROL_STATUS_REGISTER};
 pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 
-use vmm_vcpu::x86_64::{FpuState, SegmentRegister, DescriptorTable};
+use vmm_vcpu::x86_64::{FpuState, SegmentRegister, DescriptorTable, msr_index};
 
 const NUM_XMM_REGS: usize = 16;
 const NUM_FPMMX_REGS: usize = 8;
@@ -345,6 +348,49 @@ impl ConvertFpuState for WinFpuRegisters {
     }
 }
 
+pub trait ConvertMsrIndex {
+    fn to_portable(from: &Self) -> Option<u32>;
+    fn from_portable(arch_index: u32) -> Option<Self> where Self: Sized;
+}
+
+impl ConvertMsrIndex for WHV_REGISTER_NAME {
+    fn to_portable(from: &Self) -> Option<u32> {
+        match from {
+            WHV_REGISTER_NAME::WHvX64RegisterTsc => Some(msr_index::MSR_IA32_TSC),
+            WHV_REGISTER_NAME::WHvX64RegisterEfer => Some(msr_index::MSR_EFER),
+            WHV_REGISTER_NAME::WHvX64RegisterKernelGsBase => Some(msr_index::MSR_GS_BASE),
+            WHV_REGISTER_NAME::WHvX64RegisterApicBase => Some(msr_index::MSR_IA32_APICBASE),
+            WHV_REGISTER_NAME::WHvX64RegisterPat => Some(msr_index::MSR_IA32_CR_PAT),
+            WHV_REGISTER_NAME::WHvX64RegisterSysenterCs => Some(msr_index::MSR_IA32_SYSENTER_CS),
+            WHV_REGISTER_NAME::WHvX64RegisterSysenterEip => Some(msr_index::MSR_IA32_SYSENTER_EIP),
+            WHV_REGISTER_NAME::WHvX64RegisterSysenterEsp => Some(msr_index::MSR_IA32_SYSENTER_ESP),
+            WHV_REGISTER_NAME::WHvX64RegisterStar => Some(msr_index::MSR_STAR),
+            WHV_REGISTER_NAME::WHvX64RegisterLstar => Some(msr_index::MSR_LSTAR),
+            WHV_REGISTER_NAME::WHvX64RegisterCstar => Some(msr_index::MSR_CSTAR),
+            WHV_REGISTER_NAME::WHvX64RegisterSfmask => Some(msr_index::MSR_SYSCALL_MASK),
+            _ => None
+        }
+    }
+
+    fn from_portable(arch_index: u32) -> Option<Self> {
+        match arch_index {
+            msr_index::MSR_IA32_TSC => Some(WHV_REGISTER_NAME::WHvX64RegisterTsc),
+            msr_index::MSR_EFER => Some(WHV_REGISTER_NAME::WHvX64RegisterEfer),
+            msr_index::MSR_GS_BASE => Some(WHV_REGISTER_NAME::WHvX64RegisterKernelGsBase),
+            msr_index::MSR_IA32_APICBASE => Some(WHV_REGISTER_NAME::WHvX64RegisterApicBase),
+            msr_index::MSR_IA32_CR_PAT => Some(WHV_REGISTER_NAME::WHvX64RegisterPat),
+            msr_index::MSR_IA32_SYSENTER_CS => Some(WHV_REGISTER_NAME::WHvX64RegisterSysenterCs),
+            msr_index::MSR_IA32_SYSENTER_EIP => Some(WHV_REGISTER_NAME::WHvX64RegisterSysenterEip),
+            msr_index::MSR_IA32_SYSENTER_ESP => Some(WHV_REGISTER_NAME::WHvX64RegisterSysenterEsp),
+            msr_index::MSR_STAR => Some(WHV_REGISTER_NAME::WHvX64RegisterStar),
+            msr_index::MSR_LSTAR => Some(WHV_REGISTER_NAME::WHvX64RegisterLstar),
+            msr_index::MSR_CSTAR => Some(WHV_REGISTER_NAME::WHvX64RegisterCstar),
+            msr_index::MSR_SYSCALL_MASK => Some(WHV_REGISTER_NAME::WHvX64RegisterSfmask),
+            _ => None
+        }
+    }
+}
+
 pub trait ConvertSegmentRegister {
     fn to_portable(&self) -> SegmentRegister;
     fn from_portable(from: &SegmentRegister) -> Self;
@@ -422,7 +468,7 @@ impl ConvertUint128 for WHV_UINT128 {
     fn to_u8_array(uint128: &Self) -> [u8; 16usize] {
         let mut array: [u8; 16usize] = Default::default();
         let src = uint128 as *const WHV_UINT128 as *const u8;
-        let mut dst = array.as_mut_ptr();
+        let dst = array.as_mut_ptr();
 
         let dst_len = array.len();
 
@@ -439,7 +485,7 @@ impl ConvertUint128 for WHV_UINT128 {
         let mut uint128: WHV_UINT128 = Default::default();
 
         let src = array.as_ptr();
-        let mut dst = &mut uint128 as *mut WHV_UINT128 as *mut u8;
+        let dst = &mut uint128 as *mut WHV_UINT128 as *mut u8;
 
         let dst_len = array.len();
 
