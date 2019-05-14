@@ -599,7 +599,7 @@ mod tests {
         }
 
         // Convert the FpuState into WinFpuRegisters
-        let mut fregs = WinFpuRegisters::from_portable(&fpu_state_in);
+        let fregs = WinFpuRegisters::from_portable(&fpu_state_in);
 
         // Populate the WinFpuRegisters with values from FpuState
         unsafe {

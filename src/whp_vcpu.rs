@@ -22,7 +22,7 @@ pub use x86_64::XsaveArea;
 use platform::VirtualProcessor;
 use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
 use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
-                       LapicState, CpuId};
+                       LapicState, CpuId, MsrEntry};
 
 
 impl Vcpu for VirtualProcessor {
@@ -239,9 +239,30 @@ impl Vcpu for VirtualProcessor {
 
         let mut msr_names: Vec<WHV_REGISTER_NAME> = Vec::new();
         let mut msr_values: Vec<WHV_REGISTER_VALUE> = Vec::new();
+        println!("msrs: {:?}", msrs);
 
-        // TODO: Continue here. Iterate through msrs.
+        unsafe {
+            for entry in msrs.entries.as_slice(msrs.nmsrs as usize).iter() {
+                println!("Entry : {:?}", entry);
+                println!("MSR Entry Index: {:?}", entry.index);
+                let reg_name = WHV_REGISTER_NAME::from_portable(entry.index).unwrap();
+                msr_names.push(reg_name);
 
+                let mut reg_value: WHV_REGISTER_VALUE = Default::default();
+                reg_value.Reg64 = entry.data;
+                msr_values.push(reg_value);
+            }
+
+/*
+            for entry in msr_values {
+                println!("MSR Entry Value: {:?}", entry.Reg64);
+            }
+            */
+        }
+        println!("Length of msr_values: {}", msr_values.len());
+
+        self.set_registers(&msr_names, &msr_values)
+            .map_err(|_| io::Error::last_os_error())?;
         Ok(())
     }
 
@@ -293,7 +314,10 @@ impl Vcpu for VirtualProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vmm_vcpu::x86_64::{CpuIdEntry2};
+    pub use platform::Partition;
+    use vmm_vcpu::x86_64::{CpuIdEntry2, msr_index};
+    use common::*;
+    pub use std::*;
 
     fn setup_vcpu_test(p: &mut Partition) {
         let mut property: WHV_PARTITION_PROPERTY = Default::default();
@@ -403,421 +427,67 @@ mod tests {
             padding: [0, 0, 0]
         }).unwrap();
     }
-}
 
-/*
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std;
-
+    #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_create_delete_partition() {
-        println!("CreateDeletePartition");
-        let p: Partition = Partition::new().unwrap();
-        drop(p);
-    }
-
-    #[test]
-    fn test_delete_partition_panic() {
-        let result = std::panic::catch_unwind(|| {
-            // Create an invalid partition
-            let _p = Partition {
-                partition: Rc::new(RefCell::new(PartitionHandle {
-                    handle: std::ptr::null_mut(),
-                })),
-            };
-        });
-        assert!(result.is_err(), "Drop was suppoesed to panic");
-    }
-
-    #[test]
-    fn test_get_capability() {
-        let _capability: WHV_CAPABILITY =
-            get_capability(WHV_CAPABILITY_CODE::WHvCapabilityCodeHypervisorPresent).unwrap();
-    }
-
-    #[test]
-    fn test_set_get_partition_property() {
+    fn test_set_msrs() {
         let mut p: Partition = Partition::new().unwrap();
-        let property_code = WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeProcessorCount;
-        let mut property: WHV_PARTITION_PROPERTY = Default::default();
-        property.ProcessorCount = 1;
+        setup_vcpu_test(&mut p);
 
-        p.set_property(property_code, &property).unwrap();
-        let property_out = p.get_property(property_code).unwrap();
+        let vp_index: UINT32 = 0;
+        let vp = p.create_virtual_processor(vp_index).unwrap();
 
+        let entries = [
+            MsrEntry {
+                index: 0x174,
+                reserved: 0,
+                data: 25
+            },
+            MsrEntry {
+                index: msr_index::MSR_IA32_TSC,
+                reserved: 0,
+                data: 7890
+            }
+        ];
+        println!("Entries at setup: {:?}", entries);
+        let array_len = entries.len();
+
+        // Create a vector large enough to hold the MSR entry defined above in a
+        // MsrEntries structure
+        let entries_bytes = array_len * mem::size_of::<MsrEntry>();
+        let msrs_vec: Vec<u8> =
+            Vec::with_capacity(mem::size_of::<MsrEntries>() + entries_bytes);
+        let msrs: &mut MsrEntries = unsafe {
+            &mut *(msrs_vec.as_ptr() as *mut MsrEntries)
+        };
+        msrs.nmsrs = array_len as u32;
+
+        // Copy the entries into the vector
         unsafe {
+            let src = &entries as *const MsrEntry as *const u8;
+            let dst = msrs.entries.as_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(src, dst, entries_bytes);
+
             assert_eq!(
-                property.ProcessorCount, property_out.ProcessorCount,
-                "The property value is not matching"
-            );
-        }
-    }
-
-    #[test]
-    fn test_set_get_partition_property_cpuid_exits() {
-        let mut p: Partition = Partition::new().unwrap();
-        let cpuids: [UINT32; 2] = [1, 2];
-
-        // Getting this property is not supported
-        assert_eq!(
-            p.set_property_cpuid_exits(&cpuids).ok(),
-            Some(()),
-            "set_property_cpuid_exits failed"
-        );
-    }
-
-    #[test]
-    fn test_set_get_partition_property_cpuid_results() {
-        const CPUID_EXT_HYPERVISOR: UINT32 = 1 << 31;
-        let mut p: Partition = Partition::new().unwrap();
-        let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
-        let mut cpuid_result: WHV_X64_CPUID_RESULT = Default::default();
-        cpuid_result.Function = 1;
-        cpuid_result.Ecx = CPUID_EXT_HYPERVISOR;
-        cpuid_results.push(cpuid_result);
-
-        // Getting this property is not supported
-        assert_eq!(
-            p.set_property_cpuid_results(&cpuid_results).ok(),
-            Some(()),
-            "set_property_cpuid_results failed"
-        );
-    }
-
-    #[test]
-    fn test_setup_partition() {
-        let mut p: Partition = Partition::new().unwrap();
-        let mut property: WHV_PARTITION_PROPERTY = Default::default();
-        property.ProcessorCount = 1;
-
-        // Setup fails without setting at least the number of vcpus
-        p.set_property(
-            WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeProcessorCount,
-            &property,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn test_setup_partition_fail() {
-        let mut p: Partition = Partition::new().unwrap();
-        match p.setup() {
-            Err(e) => assert_eq!(
-                e.result(),
-                WHV_E_INVALID_PARTITION_CONFIG,
-                "Unexpected error code"
-            ),
-            Ok(()) => panic!("An error was expected"),
-        }
-    }
-
-    fn setup_vcpu_test(p: &mut Partition) {
-        let mut property: WHV_PARTITION_PROPERTY = Default::default();
-        property.ProcessorCount = 1;
-
-        p.set_property(
-            WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeProcessorCount,
-            &property,
-        )
-        .unwrap();
-        p.setup().unwrap();
-    }
-
-    #[test]
-    fn test_create_delete_virtual_processor() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let vp = p.create_virtual_processor(vp_index).unwrap();
-        drop(vp)
-    }
-
-    #[test]
-    fn test_run_virtual_processor() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let mut vp = p.create_virtual_processor(vp_index).unwrap();
-        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = vp.run().unwrap();
-
-        assert_eq!(
-            exit_context.ExitReason,
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess,
-            "Unexpected exit reason"
-        )
-    }
-
-    #[test]
-    fn test_cancel_virtual_processor() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let mut vp = p.create_virtual_processor(vp_index).unwrap();
-        vp.cancel_run().unwrap();
-    }
-
-    #[test]
-    #[ignore]
-    fn test_set_get_virtual_processor_registers() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let mut vp = p.create_virtual_processor(vp_index).unwrap();
-
-        const NUM_REGS: UINT32 = 1;
-        const REG_VALUE: UINT64 = 11111111;
-        let mut reg_names: [WHV_REGISTER_NAME; NUM_REGS as usize] = Default::default();
-        let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS as usize] = Default::default();
-        let mut reg_values_out: [WHV_REGISTER_VALUE; NUM_REGS as usize] = Default::default();
-
-        reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterRax;
-        reg_values[0].Reg64 = REG_VALUE;
-
-        vp.set_registers(&reg_names, &reg_values).unwrap();
-        vp.get_registers(&reg_names, &mut reg_values_out).unwrap();
-
-        unsafe {
+                msrs.entries.as_slice(array_len)[0].index,
+                0x174,
+                "Failure converting/copying MSR entry[0].index");
             assert_eq!(
-                reg_values_out[0].Reg64, REG_VALUE,
-                "Registers values do not match"
-            );
-        }
-    }
-
-    #[test]
-    fn test_map_gpa_range() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        const SIZE: UINT64 = 0x100000;
-        let guest_address: WHV_GUEST_PHYSICAL_ADDRESS = 0;
-
-        let mem = VirtualMemory::new(SIZE as usize).unwrap();
-
-        let mapping = p
-            .map_gpa_range(
-                &mem,
-                guest_address,
-                SIZE,
-                WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagRead,
-            )
-            .unwrap();
-
-        assert_eq!(mapping.get_size(), SIZE);
-        assert_eq!(mapping.get_source_address(), mem.as_ptr());
-        assert_eq!(mapping.get_guest_address(), guest_address);
-        assert_eq!(
-            mapping.get_flags(),
-            WHV_MAP_GPA_RANGE_FLAGS::WHvMapGpaRangeFlagRead
-        );
-    }
-
-    #[test]
-    fn test_translate_gva() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let vp = p.create_virtual_processor(vp_index).unwrap();
-
-        let gva: WHV_GUEST_PHYSICAL_ADDRESS = 0;
-        let (translation_result, gpa) = vp
-            .translate_gva(
-                gva,
-                WHV_TRANSLATE_GVA_FLAGS::WHvTranslateGvaFlagValidateRead,
-            )
-            .unwrap();
-
-        assert_eq!(
-            translation_result.ResultCode,
-            WHV_TRANSLATE_GVA_RESULT_CODE::WHvTranslateGvaResultGpaUnmapped,
-            "Unexpected translation result code {:?}",
-            translation_result.ResultCode
-        );
-
-        assert_eq!(gpa, 0, "Unexpected GPA value");
-    }
-
-    #[test]
-    fn test_virtual_processor_index() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let vp = p.create_virtual_processor(vp_index).unwrap();
-
-        assert_eq!(vp.index(), vp_index, "Index value not matching");
-    }
-
-    #[test]
-    #[allow(unused_variables)]
-    #[allow(unused_mut)]
-    fn test_request_interrupt() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let mut vp = p.create_virtual_processor(vp_index).unwrap();
-
-        let mut interrupt_control: WHV_INTERRUPT_CONTROL = Default::default();
-        // TriggerMode = 0 (Edge)
-        // DestinationMode = 0 (Logical)
-        // InterruptType = 0x0 (Fixed)
-        interrupt_control.TypeDestinationModeTriggerModeReserved = 0x000;
-        interrupt_control.Destination = 0;
-        interrupt_control.Vector = 0x37;
-        let interrupt_control_size = std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as UINT32;
-        match vp.request_interrupt(&interrupt_control) {
-            Err(e) => println!("Error"),
-            Ok(()) => println!("Success"),
-        }
-    }
-
-    #[test]
-    fn test_get_set_xsave_state() {
-        let mut capability_features: WHV_CAPABILITY_FEATURES;
-        capability_features.AsUINT64 = 0;
-
-        let capability: WHV_CAPABILITY =
-            get_capability(WHV_CAPABILITY_CODE::WHvCapabilityCodeFeatures).unwrap();
-        unsafe {
-            capability_features = capability.Features;
+                msrs.entries.as_slice(array_len)[0].data,
+                25,
+                "Failure converting/copying MSR entry[0].data");
+            assert_eq!(
+                msrs.entries.as_slice(array_len)[1].index,
+                msr_index::MSR_IA32_TSC,
+                "Failure converting/copying MSR entry[1].index");
+            assert_eq!(
+                msrs.entries.as_slice(array_len)[1].data,
+                7890,
+                "Failure converting/copying MSR entry[1].data");
         }
 
-        if capability_features.Xsave() != 0 {
-            let mut p: Partition = Partition::new().unwrap();
-            setup_vcpu_test(&mut p);
+        vp.set_msrs(msrs).unwrap();
 
-            let vp_index: UINT32 = 0;
-            let vp = p.create_virtual_processor(vp_index).unwrap();
-
-            let mut xsave_state: XsaveArea = Default::default();
-            assert_eq!(xsave_state.region[7], 0);
-
-            xsave_state = vp.get_xsave_state().unwrap();
-            assert_eq!(xsave_state.region[7], 0xffff);
-
-            vp.set_xsave_state(xsave_state).unwrap();
-        }
-    }
-
-    fn initialize_apic(p: &mut Partition) -> bool {
-        let capability: WHV_CAPABILITY =
-            get_capability(WHV_CAPABILITY_CODE::WHvCapabilityCodeFeatures).unwrap();
-        let features: WHV_CAPABILITY_FEATURES = unsafe { capability.Features };
-        let mut apic_enabled = false;
-
-        if features.LocalApicEmulation() != 0 {
-            let mut property: WHV_PARTITION_PROPERTY = Default::default();
-
-            property.LocalApicEmulationMode =
-                WHV_X64_LOCAL_APIC_EMULATION_MODE::WHvX64LocalApicEmulationModeXApic;
-
-            p.set_property(
-                WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeLocalApicEmulationMode,
-                &property,
-            )
-            .unwrap();
-
-            apic_enabled = true;
-        }
-
-        apic_enabled
-    }
-
-    use x86_64::*;
-    use interrupts::*;
-    #[test]
-    fn test_enable_get_set_apic() {
-        let mut p: Partition = Partition::new().unwrap();
-
-        let apic_enabled = initialize_apic(&mut p);
-
-        let mut property: WHV_PARTITION_PROPERTY = Default::default();
-        property.ProcessorCount = 1;
-
-        p.set_property(
-            WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeProcessorCount,
-            &property,
-        )
-        .unwrap();
-
-        p.setup().unwrap();
-
-        let vp_index: UINT32 = 0;
-        let vp = p.create_virtual_processor(vp_index).unwrap();
-
-        if apic_enabled == true {
-            let state: LapicState = vp.get_lapic().unwrap();
-            let icr0 = get_lapic_reg(&state, APIC_REG_OFFSET::InterruptCommand0);
-            assert_eq!(icr0, 0);
-
-            // Uses both get_lapic and set_lapic under the hood
-            set_reg_in_lapic(&vp, APIC_REG_OFFSET::InterruptCommand0, 0x40);
-
-            let state_out: LapicState = vp.get_lapic().unwrap();
-            let icr0 = get_lapic_reg(&state_out, APIC_REG_OFFSET::InterruptCommand0);
-            assert_eq!(icr0, 0x40);
-        }
-    }
-
-    #[test]
-    fn test_get_partition_counters() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-
-        let mut _vp = p.create_virtual_processor(vp_index).unwrap();
-
-        let counters: WHV_PARTITION_COUNTERS = _vp
-            .get_partition_counters(WHV_PARTITION_COUNTER_SET::WHvPartitionCounterSetMemory)
-            .unwrap();
-        let mem_counters = unsafe { counters.MemoryCounters };
-
-        assert_eq!(mem_counters.Mapped4KPageCount, 0);
-        assert_eq!(mem_counters.Mapped2MPageCount, 0);
-        assert_eq!(mem_counters.Mapped1GPageCount, 0);
-    }
-
-    #[test]
-    fn test_get_processor_counters() {
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-
-        let vp = p.create_virtual_processor(vp_index).unwrap();
-        let counters: WHV_PROCESSOR_COUNTERS = vp
-            .get_processor_counters(WHV_PROCESSOR_COUNTER_SET::WHvProcessorCounterSetRuntime)
-            .unwrap();
-        let runtime_counters = unsafe { counters.RuntimeCounters };
-        assert!(runtime_counters.TotalRuntime100ns > 0);
-
-        let counters: WHV_PROCESSOR_COUNTERS = vp
-            .get_processor_counters(WHV_PROCESSOR_COUNTER_SET::WHvProcessorCounterSetIntercepts)
-            .unwrap();
-        let intercept_counters = unsafe { counters.InterceptCounters };
-        assert_eq!(intercept_counters.PageInvalidations.Count, 0);
-
-        let counters: WHV_PROCESSOR_COUNTERS = vp
-            .get_processor_counters(WHV_PROCESSOR_COUNTER_SET::WHvProcessorCounterSetEvents)
-            .unwrap();
-        let event_counters = unsafe { counters.EventCounters };
-        assert_eq!(event_counters.PageFaultCount, 0);
-
-        let counters: WHV_PROCESSOR_COUNTERS = vp
-            .get_processor_counters(WHV_PROCESSOR_COUNTER_SET::WHvProcessorCounterSetApic)
-            .unwrap();
-        let apic_counters = unsafe { counters.ApicCounters };
-        assert_eq!(apic_counters.SentIpiCount, 0);
+        // Now test getting the data back
     }
 }
-
-*/
