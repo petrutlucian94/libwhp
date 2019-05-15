@@ -109,6 +109,9 @@ impl Partition {
         property: *const VOID,
         size: UINT32,
     ) -> Result<(), WHPError> {
+        let handle = *self.partition.borrow().handle();
+        println!("HANDLE (set prop): {:?}", handle);
+
         check_result(unsafe {
             WHvSetPartitionProperty(
                 *self.partition.borrow_mut().handle(),
@@ -140,7 +143,6 @@ impl Partition {
         size: UINT32,
     ) -> Result<UINT32, WHPError> {
         let mut written_size: UINT32 = 0;
-
         check_result(unsafe {
             WHvGetPartitionProperty(
                 *self.partition.borrow().handle(),
@@ -244,30 +246,6 @@ impl VirtualProcessor {
 
     pub fn last_exit_context(&self) -> WHV_RUN_VP_EXIT_CONTEXT {
         return self.exit_context;
-    }
-
-    ///
-    /// While Hyper-V sets CPUID results on the partition level, other hypervisor
-    /// APIs allow for the CPUID results to be set on a per-vcpu level. Provide
-    /// a bridge for that to happen here, but with the understanding that it's
-    /// actually setting the result on the partition, not virtual processor,
-    /// level.
-    /// 
-    pub fn set_cpuid_results_on_partition(
-        &self,
-        cpuid_results: &[WHV_X64_CPUID_RESULT],
-    ) -> Result<(), WHPError> {
-
-        check_result(unsafe {
-            WHvSetPartitionProperty(
-                *self.partition.borrow_mut().handle(),
-                WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeCpuidResultList,
-                cpuid_results.as_ptr() as *const VOID,
-                (std::mem::size_of::<WHV_X64_CPUID_RESULT>() * cpuid_results.len()) as UINT32,
-            )
-        })?;
-
-        Ok(())
     }
 
     pub fn do_run(&self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {

@@ -18,6 +18,7 @@ pub use whp_vcpu_structs::*;
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
+pub use common::*;
 
 use platform::VirtualProcessor;
 use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
@@ -202,15 +203,35 @@ impl Vcpu for VirtualProcessor {
         Ok(())
     }
 
-    /// According to the Windows Hypervisor Top Level Functional Specification,
-    /// the virtualized values of CPUID leaves are pre-determined (ie,
-    /// per the specification, each leaf is either set, cleared, or passed-through
-    /// from hardware) and cannot be configured.
+    /// x86-specific call to setup the CPUID registers.
+    /// 
+    /// Unimplemented in WHP because it is not possible to do this from the vCPU
+    /// level.
+    /// 
+    /// CPUID results _can_ be set on a partition level, however, this must be
+    /// done via WHvSetPartitionProperty, which itself must be called after
+    /// before WHvSetupPartition. Since
+    /// a vCPU cannot be created (via WHvCreateVirtualProcessor) until
+    /// after WHvSetupPartition finalizes partition properties, it is impossible
+    /// to call WHvSetPartitionProperty after a vCPU has been created. In other
+    /// words, the mandatory order of operations is:
+    /// - WHvCreatePartition
+    /// - WHvSetPartitionProperty (which can optionally set the
+    ///   WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeCpuidResultList 
+    ///   property)
+    /// - WHvSetupPartition
+    /// - WHvCreateVirtualProcessor
+    /// 
+    #[allow(unreachable_code)]
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn set_cpuid2(&self, cpuid: &CpuId) -> VcpuResult<()> {
+    fn set_cpuid2(&self, _cpuid: &CpuId) -> VcpuResult<()> {
+
+        unimplemented!();
+
+        /*
         let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
 
-        for entry in cpuid.as_entries_slice().iter() {
+        for entry in _cpuid.as_entries_slice().iter() {
             let mut cpuid_result: WHV_X64_CPUID_RESULT = Default::default();
             cpuid_result.Function = entry.function;
             cpuid_result.Eax = entry.eax;
@@ -222,29 +243,51 @@ impl Vcpu for VirtualProcessor {
         }
 
         self.set_cpuid_results_on_partition(&cpuid_results).unwrap();
+        */
 
-        Ok(())
+        return Ok(())
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn get_msrs(&self, _msrs: &mut MsrEntries) -> VcpuResult<i32> {
-        Ok(0)
+    fn get_msrs(&self, msrs: &mut MsrEntries) -> VcpuResult<i32> {
+        let mut msr_names: Vec<WHV_REGISTER_NAME> = Vec::new();
+        let mut msr_values: Vec<WHV_REGISTER_VALUE> = Vec::new();
+
+        let num_msrs = msrs.nmsrs as usize;
+
+        // Translate each MSR index into its corresponding MSR NAME
+        unsafe {
+            for entry in msrs.entries.as_slice(num_msrs).iter() {
+                let reg_name = WHV_REGISTER_NAME::from_portable(entry.index).unwrap();
+                msr_names.push(reg_name);
+
+                // Push a corresponding blank MSR Value to the value array
+                let reg_value: WHV_REGISTER_VALUE = Default::default();
+                msr_values.push(reg_value);
+            }
+        }
+
+        // Get the MSR values
+        self.get_registers(&msr_names, &mut msr_values)
+            .map_err(|_| io::Error::last_os_error())?;
+        
+        // Now re-insert the returned MSR data in the original MsrEntries
+        unsafe {
+            for (idx, entry) in msrs.entries.as_mut_slice(num_msrs).iter_mut().enumerate() {
+                entry.data = msr_values[idx].Reg64;
+            }
+        }
+
+        Ok(num_msrs as i32)
     }
 
     fn set_msrs(&self, msrs: &MsrEntries) -> VcpuResult<()> {
-        // Need to create a mapping between arch_gen indices of MSRs and the
-        // MSRs that WHV exposes. Each mapping will consist of a tuple of
-        // the MSR index and the WHV register name. Non-supported MSRs should
-        // be empty/identifiabler
 
         let mut msr_names: Vec<WHV_REGISTER_NAME> = Vec::new();
         let mut msr_values: Vec<WHV_REGISTER_VALUE> = Vec::new();
-        println!("msrs: {:?}", msrs);
 
         unsafe {
             for entry in msrs.entries.as_slice(msrs.nmsrs as usize).iter() {
-                println!("Entry : {:?}", entry);
-                println!("MSR Entry Index: {:?}", entry.index);
                 let reg_name = WHV_REGISTER_NAME::from_portable(entry.index).unwrap();
                 msr_names.push(reg_name);
 
@@ -252,17 +295,11 @@ impl Vcpu for VirtualProcessor {
                 reg_value.Reg64 = entry.data;
                 msr_values.push(reg_value);
             }
-
-/*
-            for entry in msr_values {
-                println!("MSR Entry Value: {:?}", entry.Reg64);
-            }
-            */
         }
-        println!("Length of msr_values: {}", msr_values.len());
 
         self.set_registers(&msr_names, &msr_values)
             .map_err(|_| io::Error::last_os_error())?;
+
         Ok(())
     }
 
@@ -403,6 +440,7 @@ mod tests {
         );
     }
 
+    #[ignore]
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_set_cpuid2() {
@@ -426,11 +464,13 @@ mod tests {
             edx: 0,
             padding: [0, 0, 0]
         }).unwrap();
+
+        vp.set_cpuid2(&cpuid).unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_set_msrs() {
+    fn test_set_and_get_msrs() {
         let mut p: Partition = Partition::new().unwrap();
         setup_vcpu_test(&mut p);
 
@@ -444,12 +484,11 @@ mod tests {
                 data: 25
             },
             MsrEntry {
-                index: msr_index::MSR_IA32_TSC,
+                index: msr_index::MSR_IA32_SYSENTER_EIP,
                 reserved: 0,
                 data: 7890
             }
         ];
-        println!("Entries at setup: {:?}", entries);
         let array_len = entries.len();
 
         // Create a vector large enough to hold the MSR entry defined above in a
@@ -460,6 +499,8 @@ mod tests {
         let msrs: &mut MsrEntries = unsafe {
             &mut *(msrs_vec.as_ptr() as *mut MsrEntries)
         };
+
+        // Set the number of entries
         msrs.nmsrs = array_len as u32;
 
         // Copy the entries into the vector
@@ -467,7 +508,9 @@ mod tests {
             let src = &entries as *const MsrEntry as *const u8;
             let dst = msrs.entries.as_ptr() as *mut u8;
             std::ptr::copy_nonoverlapping(src, dst, entries_bytes);
+        }
 
+        unsafe {
             assert_eq!(
                 msrs.entries.as_slice(array_len)[0].index,
                 0x174,
@@ -478,7 +521,7 @@ mod tests {
                 "Failure converting/copying MSR entry[0].data");
             assert_eq!(
                 msrs.entries.as_slice(array_len)[1].index,
-                msr_index::MSR_IA32_TSC,
+                msr_index::MSR_IA32_SYSENTER_EIP,
                 "Failure converting/copying MSR entry[1].index");
             assert_eq!(
                 msrs.entries.as_slice(array_len)[1].data,
@@ -489,5 +532,57 @@ mod tests {
         vp.set_msrs(msrs).unwrap();
 
         // Now test getting the data back
+        let out_entries = [
+            MsrEntry {
+                index: 0x174,
+                ..Default::default()
+            },
+            MsrEntry {
+                index: msr_index::MSR_IA32_SYSENTER_EIP,
+                ..Default::default()
+            }
+        ];
+
+        // Create a vector large enough to hold the MSR entry defined above in a
+        // MsrEntries structure
+        let out_entries_bytes = out_entries.len() * mem::size_of::<MsrEntry>();
+        let out_msrs_vec: Vec<u8> =
+            Vec::with_capacity(mem::size_of::<MsrEntries>() + out_entries_bytes);
+        let mut out_msrs: &mut MsrEntries = unsafe {
+            &mut *(out_msrs_vec.as_ptr() as *mut MsrEntries)
+        };
+
+        // Set the number of entries
+        out_msrs.nmsrs = out_entries.len() as u32;
+
+        // Copy the entries into the vector
+        unsafe {
+            let src = &out_entries as *const MsrEntry as *const u8;
+            let dst = out_msrs.entries.as_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(src, dst, out_entries_bytes);
+        }
+
+        vp.get_msrs(&mut out_msrs).unwrap();
+
+        assert_eq!(msrs.nmsrs, out_msrs.nmsrs, "Mismatch between number of get and set MSRs");
+
+        unsafe {
+            let num_msrs = msrs.nmsrs as usize;
+            for (idx, entry) in msrs.entries.as_slice(num_msrs).iter().enumerate() {
+                let out_entry = out_msrs.entries.as_slice(num_msrs)[idx];
+                println!("entry[{}]: {:?}", idx, entry);
+                println!("out_entry[{}]: {:?}", idx, out_entry);
+                assert_eq!(
+                    entry.index, 
+                    out_entry.index, 
+                    "MSR index gotten from vCPU did not match input"
+                );
+                assert_eq!(
+                    entry.data, 
+                    out_entry.data, 
+                    "MSR data gotten from vCPU did not match input"
+                );
+            }
+        }
     }
 }

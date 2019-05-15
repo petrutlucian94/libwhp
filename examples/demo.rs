@@ -20,7 +20,6 @@ extern crate vmm_vcpu;
 use libwhp::instruction_emulator::*;
 use libwhp::memory::*;
 use libwhp::*;
-use libwhp::whp_vcpu::*;
 use vmm_vcpu::vcpu::{Vcpu};
 
 use std::cell::RefCell;
