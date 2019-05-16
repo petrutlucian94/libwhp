@@ -23,7 +23,7 @@ pub use common::*;
 use platform::VirtualProcessor;
 use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
 use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
-                       LapicState, CpuId, MsrEntry};
+                       LapicState, CpuId};
 
 
 impl Vcpu for VirtualProcessor {
@@ -352,7 +352,7 @@ impl Vcpu for VirtualProcessor {
 mod tests {
     use super::*;
     pub use platform::Partition;
-    use vmm_vcpu::x86_64::{CpuIdEntry2, msr_index};
+    use vmm_vcpu::x86_64::{CpuIdEntry2, MsrEntry, msr_index};
     use common::*;
     pub use std::*;
 

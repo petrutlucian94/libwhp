@@ -14,7 +14,7 @@ Rust Windows Hypervisor Platform API
 [dependencies]
 libc = "0.2"
 bitflags = "1.0"
-byteorder = "=1.2.1"
+byteorder = "=1.1.0"
 vmm-vcpu = { path = "../vmm-vcpu"}
 
 [lib]
