@@ -308,14 +308,33 @@ impl Vcpu for VirtualProcessor {
 
         let exit_reason = 
             match exit_context.ExitReason {
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::None,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => VcpuExit::MemoryAccess,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => VcpuExit::IoPortAccess,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::Unknown,
+                /*
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
+                    let _memory_access = unsafe { exit_context.anon_union.MemoryAccess };
+
+                    // This is what we want, just need to figure out right way to 
+                    //   do 'inner'
+                    let io_data_ptr = inner.io_data.as_mut_ptr();
+                    let io_data = 
+                        unsafe { std::slice::from_raw_parts_mut(io_data_ptr, inner.io_data_len) };
+                    if memory_access.AccessInfo.AccessType() == 0 {
+                        VcpuExit::MmioRead(memory_access.Gpa, io_data)
+                    }
+                    else if memory_access.AccessInfo.AccessType() == 1 {
+                        VcpuExit::MmioWrite(memory_access.Gpa, io_data)
+                    }
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
+                    let _io_access = unsafe { exit_context.anon_union.IoPortAccess};
+                    let vp_context = exit_context.VpContext;
+                }
+                */
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnrecoverableException => {
-                    VcpuExit::UnrecoverableException
+                    VcpuExit::Exception
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonInvalidVpRegisterValue => {
-                    VcpuExit::InvalidVpRegisterValue
+                    VcpuExit::FailEntry
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnsupportedFeature => {
                     VcpuExit::UnsupportedFeature
@@ -326,9 +345,10 @@ impl Vcpu for VirtualProcessor {
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => VcpuExit::Hlt,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => VcpuExit::IoapicEoi,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => VcpuExit::MsrAccess,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => VcpuExit::Cpuid,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => VcpuExit::CpuId,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonException => VcpuExit::Exception,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonCanceled => VcpuExit::Canceled,
+                _ => VcpuExit::Unknown,
             };
 
         Ok(exit_reason)
