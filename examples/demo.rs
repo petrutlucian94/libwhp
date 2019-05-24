@@ -15,12 +15,10 @@
 
 extern crate libc;
 extern crate libwhp;
-extern crate vmm_vcpu;
 
 use libwhp::instruction_emulator::*;
 use libwhp::memory::*;
 use libwhp::*;
-use vmm_vcpu::vcpu::{Vcpu};
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -97,7 +95,7 @@ fn main() {
         vp_ref_cell: &vp_ref_cell,
     };
 
-    let mut e = Emulator::new(&mut callbacks).unwrap();
+    let mut e = Emulator::<SampleCallbacks>::new().unwrap();
 
     if cpu_info.apic_enabled {
         // Set the APIC base and send an interrupt to the VCPU
@@ -107,57 +105,48 @@ fn main() {
     }
 
     loop {
-        //let exit_context = vp_ref_cell.borrow_mut().run().unwrap();
-        vp_ref_cell.borrow().run().unwrap();
+        let exit_context = vp_ref_cell.borrow_mut().do_run().unwrap();
 
-        {
-            // Keep a reference on the vcpu for as long as we keep a reference
-            // on its run/exit context
-            let vcpu = vp_ref_cell.borrow();
-
-            let exit_context = vcpu.get_run_context();
-
-            match exit_context.ExitReason {
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => {
-                    println!("All done!");
-                    break;
-                }
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonException => {
-                    break;
-                }
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
-                    handle_mmio_exit(&mut e, &exit_context)
-                }
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
-                    handle_io_port_exit(&mut e, &exit_context)
-                }
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => {
-                    handle_cpuid_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
-                }
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => {
-                    handle_msr_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
-                }
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => {
-                    continue;
-                }
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64InterruptWindow => {
-                    continue;
-                }
-                _ => panic!("Unexpected exit type: {:?}", exit_context.ExitReason),
-            };
-
-            // With the APIC enabled, the hlt instruction will not completely halt
-            // the processor; it'll just halt it until another interrupt is
-            // received, so we don't receive the VMexit that we used to use to end
-            // VCPU execution. Since WHV will not let us disable the APIC in the usual
-            // means (eg, via the global enable flag of the APIC_BASE register,
-            // etc), teriminate the VCPU execution loop when both interrupts we're
-            // expecting have been received. Plus we get to exercise the new
-            // counter APIs.
-            if all_interrupts_received(&vp_ref_cell.borrow()) {
-                println!("All interrupts received. All done!");
+        match exit_context.ExitReason {
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => {
+                println!("All done!");
                 break;
             }
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonException => {
+                break;
+            }
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
+                handle_mmio_exit(&mut e, &mut callbacks, &exit_context)
+            }
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
+                handle_io_port_exit(&mut e, &mut callbacks, &exit_context)
+            }
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => {
+                handle_cpuid_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
+            }
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => {
+                handle_msr_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
+            }
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => {
+                println!("ApicEoi");
+            }
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64InterruptWindow => {
+                println!("Interrupt window");
+            }
+            _ => panic!("Unexpected exit type: {:?}", exit_context.ExitReason),
+        };
+
+        // With the APIC enabled, the hlt instruction will not completely halt
+        // the processor; it'll just halt it until another interrupt is
+        // received, so we don't receive the VMexit that we used to use to end
+        // VCPU execution. Since WHV will not let us disable the APIC in the usual
+        // means (eg, via the global enable flag of the APIC_BASE register,
+        // etc), teriminate the VCPU execution loop when both interrupts we're
+        // expecting have been received. Plus we get to exercise the new
+        // counter APIs.
+        if all_interrupts_received(&vp_ref_cell.borrow()) {
+            println!("All interrupts received. All done!");
+            break;
         }
     }
 }
@@ -193,7 +182,6 @@ fn set_apic_base(vp: &mut VirtualProcessor) {
 
     // Get the registers as a baseline
     vp.get_registers(&reg_names, &mut reg_values).unwrap();
-    // let mut flags = reg_values[0].Reg64 ;
     let mut flags = unsafe { reg_values[0].Reg64 };
 
     // Mask off the bottom 12 bits, which are used to store flags
@@ -352,12 +340,13 @@ fn handle_cpuid_exit(vp: &mut VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_C
 
 fn handle_mmio_exit<T: EmulatorCallbacks>(
     e: &mut Emulator<T>,
+    context: &mut T,
     exit_context: &WHV_RUN_VP_EXIT_CONTEXT,
 ) {
     let mem_access_ctx = unsafe { &exit_context.anon_union.MemoryAccess };
     let _status = e
         .try_mmio_emulation(
-            std::ptr::null_mut(),
+            context,
             &exit_context.VpContext,
             mem_access_ctx,
         )
@@ -366,12 +355,13 @@ fn handle_mmio_exit<T: EmulatorCallbacks>(
 
 fn handle_io_port_exit<T: EmulatorCallbacks>(
     e: &mut Emulator<T>,
+    context: &mut T,
     exit_context: &WHV_RUN_VP_EXIT_CONTEXT,
 ) {
     let io_port_access_ctx = unsafe { &exit_context.anon_union.IoPortAccess };
     let _status = e
         .try_io_emulation(
-            std::ptr::null_mut(),
+            context,
             &exit_context.VpContext,
             io_port_access_ctx,
         )
@@ -572,7 +562,6 @@ struct SampleCallbacks<'a> {
 impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
     fn io_port(
         &mut self,
-        _context: *mut VOID,
         io_access: &mut WHV_EMULATOR_IO_ACCESS_INFO,
     ) -> HRESULT {
         if io_access.Port == 42 {
@@ -591,21 +580,21 @@ impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
 
     fn memory(
         &mut self,
-        _context: *mut VOID,
         memory_access: &mut WHV_EMULATOR_MEMORY_ACCESS_INFO,
     ) -> HRESULT {
+        let addr = memory_access.GpaAddress;
         match memory_access.AccessSize {
             8 => match memory_access.Direction {
                 0 => {
                     let data = &memory_access.Data as *const _ as *mut u64;
                     unsafe {
                         *data = 0x1000;
-                        println!("MMIO read: 0x{:x}", *data);
+                        println!("MMIO read: 0x{:x} @0x{:x}", *data, addr);
                     }
                 }
                 _ => {
                     let value = unsafe { *(&memory_access.Data as *const _ as *const u64) };
-                    println!("MMIO write: 0x{:x}", value);
+                    println!("MMIO write: 0x{:x} @0x{:x}", value, addr);
                 }
             },
             4 => match memory_access.Direction {
@@ -613,12 +602,12 @@ impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
                     let data = &memory_access.Data as *const _ as *mut u32;
                     unsafe {
                         *data = 0x1000;
-                        println!("MMIO read: 0x{:x}", *data);
+                        println!("MMIO read: 0x{:x} @0x{:x}", *data, addr);
                     }
                 }
                 _ => {
                     let value = unsafe { *(&memory_access.Data as *const _ as *const u32) };
-                    println!("MMIO write: 0x{:x}", value);
+                    println!("MMIO write: 0x{:x} @0x{:x}", value, addr);
                 }
             },
             _ => println!("Unsupported MMIO access size: {}", memory_access.AccessSize),
@@ -629,7 +618,6 @@ impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
 
     fn get_virtual_processor_registers(
         &mut self,
-        _context: *mut VOID,
         register_names: &[WHV_REGISTER_NAME],
         register_values: &mut [WHV_REGISTER_VALUE],
     ) -> HRESULT {
@@ -642,7 +630,6 @@ impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
 
     fn set_virtual_processor_registers(
         &mut self,
-        _context: *mut VOID,
         register_names: &[WHV_REGISTER_NAME],
         register_values: &[WHV_REGISTER_VALUE],
     ) -> HRESULT {
@@ -655,7 +642,6 @@ impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
 
     fn translate_gva_page(
         &mut self,
-        _context: *mut VOID,
         gva: WHV_GUEST_VIRTUAL_ADDRESS,
         translate_flags: WHV_TRANSLATE_GVA_FLAGS,
         translation_result: &mut WHV_TRANSLATE_GVA_RESULT_CODE,
