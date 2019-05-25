@@ -248,7 +248,7 @@ impl VirtualProcessor {
         return self.exit_context;
     }
 
-    pub fn do_run(&self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
+    pub fn do_run(&mut self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
         let mut exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
         let exit_context_size = std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as UINT32;
 
@@ -260,6 +260,9 @@ impl VirtualProcessor {
                 exit_context_size,
             )
         })?;
+
+        self.exit_context = exit_context;
+
         Ok(exit_context)
     }
 

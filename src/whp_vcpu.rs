@@ -20,18 +20,19 @@ pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 pub use common::*;
 
-use platform::VirtualProcessor;
+use platform::{VirtualProcessor, Partition};
+use instruction_emulator::{Emulator, EmulatorCallbacks};
 use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
 use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
                        LapicState, CpuId};
 
-
 impl Vcpu for VirtualProcessor {
 
-    type RunContextType = WHV_RUN_VP_EXIT_CONTEXT;
+    //type RunContextType = WHV_RUN_VP_EXIT_CONTEXT;
+    type RunContextType = *const u8;
 
-    fn get_run_context(&self) -> WHV_RUN_VP_EXIT_CONTEXT {
-        self.last_exit_context()
+    fn get_run_context(&self) -> Self::RunContextType {
+        &self.last_exit_context() as *const WHV_RUN_VP_EXIT_CONTEXT as *const u8
     }
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
@@ -309,27 +310,10 @@ impl Vcpu for VirtualProcessor {
         let exit_reason = 
             match exit_context.ExitReason {
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::Unknown,
-                /*
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
-                    let _memory_access = unsafe { exit_context.anon_union.MemoryAccess };
-
-                    // This is what we want, just need to figure out right way to 
-                    //   do 'inner'
-                    let io_data_ptr = inner.io_data.as_mut_ptr();
-                    let io_data = 
-                        unsafe { std::slice::from_raw_parts_mut(io_data_ptr, inner.io_data_len) };
-                    if memory_access.AccessInfo.AccessType() == 0 {
-                        VcpuExit::MmioRead(memory_access.Gpa, io_data)
-                    }
-                    else if memory_access.AccessInfo.AccessType() == 1 {
-                        VcpuExit::MmioWrite(memory_access.Gpa, io_data)
-                    }
-                }
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
-                    let _io_access = unsafe { exit_context.anon_union.IoPortAccess};
-                    let vp_context = exit_context.VpContext;
-                }
-                */
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => 
+                    VcpuExit::MemoryAccess,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => 
+                    VcpuExit::IoPortAccess,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnrecoverableException => {
                     VcpuExit::Exception
                 }
@@ -367,6 +351,34 @@ impl Vcpu for VirtualProcessor {
         Ok(())
     }
 }
+
+/*
+pub struct WhpVcpu<T: EmulatorCallbacks> {
+    vp: VirtualProcessor,
+    emulator: Emulator<T>,
+    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
+    io_data: [u8; 8],
+    io_data_len: usize,
+}
+
+impl<T: EmulatorCallbacks> WhpVcpu<T> {
+    fn new(
+        id: UINT32,
+        partition: Partition,
+        emulator_callbacks: T,
+    ) -> Self {
+        let vp = partition.create_virtual_processor(id).unwrap();
+
+        return WhpVcpu {
+            vp: vp,
+            emulator: Emulator::<T>::new().unwrap(),
+            exit_context: Default::default(),
+            io_data: Default::default(),
+            io_data_len: 0,
+        }
+    }
+}
+*/
 
 #[cfg(test)]
 mod tests {
