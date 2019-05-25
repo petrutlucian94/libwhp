@@ -14,6 +14,7 @@
 // under the License.
 
 use std::io;
+use std::cell::RefCell;
 pub use whp_vcpu_structs::*;
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
@@ -26,20 +27,36 @@ use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
 use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
                        LapicState, CpuId};
 
-impl Vcpu for VirtualProcessor {
+pub struct WhpVirtualProcessor {
+    vp: RefCell<VirtualProcessor>,
+    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
+}
+
+impl WhpVirtualProcessor {
+    fn new(vp: VirtualProcessor) -> Self {
+        return WhpVirtualProcessor {
+            vp: RefCell::new(vp),
+            exit_context: Default::default(),
+        }
+    }
+}
+
+impl Vcpu for WhpVirtualProcessor {
 
     //type RunContextType = WHV_RUN_VP_EXIT_CONTEXT;
     type RunContextType = *const u8;
 
     fn get_run_context(&self) -> Self::RunContextType {
-        &self.last_exit_context() as *const WHV_RUN_VP_EXIT_CONTEXT as *const u8
+        &self.exit_context as *const WHV_RUN_VP_EXIT_CONTEXT as *const u8
     }
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     fn get_regs(&self) -> VcpuResult<StandardRegisters> {
         let mut win_regs: WinStandardRegisters = Default::default();
 
-        self.get_registers(&win_regs.names, &mut win_regs.values)
+        self.vp
+            .borrow()
+            .get_registers(&win_regs.names, &mut win_regs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
         unsafe {
@@ -95,7 +112,9 @@ impl Vcpu for VirtualProcessor {
         win_regs.values[WinStandardRegIndex::Rip as usize].Reg64 = regs.rip;
         win_regs.values[WinStandardRegIndex::Rflags as usize].Reg64 = regs.rflags;
 
-        self.set_registers(&win_regs.names, &win_regs.values)
+        self.vp
+            .borrow()
+            .set_registers(&win_regs.names, &win_regs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
@@ -104,7 +123,9 @@ impl Vcpu for VirtualProcessor {
     fn get_sregs(&self) -> VcpuResult<SpecialRegisters> {
         let mut win_sregs: WinSpecialRegisters = Default::default();
 
-        self.get_registers(&win_sregs.names, &mut win_sregs.values)
+        self.vp
+            .borrow()
+            .get_registers(&win_sregs.names, &mut win_sregs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
         unsafe {
@@ -177,7 +198,9 @@ impl Vcpu for VirtualProcessor {
         win_sregs.values[WinSpecialRegIndex::Efer as usize].Reg64 = sregs.efer;
         win_sregs.values[WinSpecialRegIndex::ApicBase as usize].Reg64 = sregs.apic_base;
 
-        self.set_registers(&win_sregs.names, &win_sregs.values)
+        self.vp
+            .borrow()
+            .set_registers(&win_sregs.names, &win_sregs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
@@ -187,7 +210,9 @@ impl Vcpu for VirtualProcessor {
         let mut fregs: WinFpuRegisters = Default::default();
 
         // Get the registers from the vCPU
-        self.get_registers(&fregs.names, &mut fregs.values)
+        self.vp
+            .borrow()
+            .get_registers(&fregs.names, &mut fregs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
         // Perform the conversion from these fields to FpuState fields
@@ -199,7 +224,9 @@ impl Vcpu for VirtualProcessor {
     fn set_fpu(&self, fpu: &FpuState) -> VcpuResult<()> {
         let fregs: WinFpuRegisters = ConvertFpuState::from_portable(&fpu);
 
-        self.set_registers(&fregs.names, &fregs.values)
+        self.vp
+            .borrow()
+            .set_registers(&fregs.names, &fregs.values)
             .map_err(|_| io::Error::last_os_error()).unwrap();
         Ok(())
     }
@@ -269,7 +296,9 @@ impl Vcpu for VirtualProcessor {
         }
 
         // Get the MSR values
-        self.get_registers(&msr_names, &mut msr_values)
+        self.vp
+            .borrow()
+            .get_registers(&msr_names, &mut msr_values)
             .map_err(|_| io::Error::last_os_error())?;
         
         // Now re-insert the returned MSR data in the original MsrEntries
@@ -298,14 +327,16 @@ impl Vcpu for VirtualProcessor {
             }
         }
 
-        self.set_registers(&msr_names, &msr_values)
+        self.vp
+            .borrow()
+            .set_registers(&msr_names, &msr_values)
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
     }
 
     fn run(&self) -> VcpuResult<VcpuExit> {
-        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = self.do_run().unwrap();
+        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = self.vp.borrow_mut().do_run().unwrap();
 
         let exit_reason = 
             match exit_context.ExitReason {
@@ -339,13 +370,13 @@ impl Vcpu for VirtualProcessor {
     }
 
     fn get_lapic(&self) -> VcpuResult<LapicState> {
-        let state: LapicState = self.get_lapic_state()
+        let state: LapicState = self.vp.borrow().get_lapic_state()
                     .map_err(|_| io::Error::last_os_error())?;
         Ok(state)
     }
 
     fn set_lapic(&self, klapic: &LapicState) -> VcpuResult<()> {
-        self.set_lapic_state(klapic)
+        self.vp.borrow().set_lapic_state(klapic)
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
