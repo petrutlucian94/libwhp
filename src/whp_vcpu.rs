@@ -15,8 +15,10 @@
 
 use std::io;
 use std::cell::RefCell;
+use std::rc::Rc;
 pub use whp_vcpu_structs::*;
 pub use win_hv_platform_defs::*;
+pub use win_hv_emulation_defs::*;
 pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 pub use common::*;
@@ -27,27 +29,68 @@ use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
 use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
                        LapicState, CpuId};
 
+pub struct WhpIoAccessData {
+    io_data: [u8; 8],
+    io_data_len: usize,
+    port: u16,
+}
+
+impl Default for WhpIoAccessData {
+    fn default() -> Self {
+        unsafe { ::std::mem::zeroed() }
+    }
+}
+
+pub struct WhpMmioAccessData {
+    io_data: [u8; 8],
+    io_data_len: usize,
+    gpa: u64,
+}
+
+impl Default for WhpMmioAccessData {
+    fn default() -> Self {
+        unsafe { ::std::mem::zeroed() }
+    }
+}
+
+pub struct WhpContext {
+    last_exit_context: WHV_RUN_VP_EXIT_CONTEXT,
+    io_access_data: WhpIoAccessData,
+    mmio_access_data: WhpMmioAccessData,
+}
+
+impl WhpContext {
+    fn get_run_context_ptr(&self) -> *const WHV_RUN_VP_EXIT_CONTEXT {
+        &self.last_exit_context as *const WHV_RUN_VP_EXIT_CONTEXT
+    }
+}
+
 pub struct WhpVirtualProcessor {
-    vp: RefCell<VirtualProcessor>,
-    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
+    pub vp: RefCell<VirtualProcessor>,
+    emulator: Emulator<Self>,
+    whp_context: RefCell<WhpContext>,
 }
 
 impl WhpVirtualProcessor {
-    fn new(vp: VirtualProcessor) -> Self {
+    pub fn create_whp_vcpu(vp: VirtualProcessor) -> Self {
         return WhpVirtualProcessor {
             vp: RefCell::new(vp),
-            exit_context: Default::default(),
-        }
+            emulator: Emulator::<Self>::new().unwrap(),
+            whp_context: RefCell::new(WhpContext {
+                last_exit_context: Default::default(),
+                io_access_data: Default::default(),
+                mmio_access_data: Default::default(),
+            })
+        };
     }
 }
 
 impl Vcpu for WhpVirtualProcessor {
 
-    //type RunContextType = WHV_RUN_VP_EXIT_CONTEXT;
-    type RunContextType = *const u8;
+    type RunContextType = *const WHV_RUN_VP_EXIT_CONTEXT;
 
     fn get_run_context(&self) -> Self::RunContextType {
-        &self.exit_context as *const WHV_RUN_VP_EXIT_CONTEXT as *const u8
+        self.whp_context.borrow().get_run_context_ptr()
     }
 
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
@@ -336,15 +379,38 @@ impl Vcpu for WhpVirtualProcessor {
     }
 
     fn run(&self) -> VcpuResult<VcpuExit> {
-        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = self.vp.borrow_mut().do_run().unwrap();
+
+        // In the case of an MMIO or IO Port read, the guest physical address
+        // or port (respectively) will be recorded by the MMIO and IO Port
+        // emulation callbacks (respectively). This data will be returned to
+        // the caller VMM in the VpuExit value, along with pointers to where
+        // the data should actually be written after the MMIO or IO port read
+        // performed by the VMM. Before calling do_run() on the VirtualProcessor
+        // again, this function will emulate the MMIO or IO Port read again,
+        // actually storing the data in the byte array that the hypervisor
+        // will return to the guest. Thus, in the read case, there are two calls
+        // to IO emulator callbacks: Once after the run() to get the GPA or Port,
+        // and once before the next run(), to store the data from the read in
+        // the buffer.
+
+        // Chronologically "second" emulation, which closes the loop by supplying
+        // the read data requested by the previous run
+        //let prev_exit_reason = self.
+
+        //let exit_context = self.vp.borrow_mut().do_run().unwrap();
+        //self.last_exit_context = self.vp.borrow_mut().do_run().unwrap();
+        let exit_context = self.vp.borrow_mut().do_run().unwrap();
+        //self.last_exit_context = exit_context;
 
         let exit_reason = 
             match exit_context.ExitReason {
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::Unknown,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => 
-                    VcpuExit::MemoryAccess,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => 
-                    VcpuExit::IoPortAccess,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
+                    VcpuExit::MemoryAccess
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
+                    VcpuExit::IoPortAccess
+                }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnrecoverableException => {
                     VcpuExit::Exception
                 }
@@ -366,6 +432,8 @@ impl Vcpu for WhpVirtualProcessor {
                 _ => VcpuExit::Unknown,
             };
 
+        self.whp_context.borrow_mut().last_exit_context = exit_context;
+
         Ok(exit_reason)
     }
 
@@ -380,6 +448,92 @@ impl Vcpu for WhpVirtualProcessor {
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
+    }
+}
+
+impl EmulatorCallbacks for WhpVirtualProcessor {
+    fn io_port(
+        &mut self,
+        io_access: &mut WHV_EMULATOR_IO_ACCESS_INFO,
+    ) -> HRESULT {
+
+        assert!((io_access.AccessSize == 1) ||
+                (io_access.AccessSize == 2) ||
+                (io_access.AccessSize == 4));
+
+        // Copy the IO Port Access data to the WhpVirtualProcessor state
+        self.whp_context.borrow_mut().io_access_data.port = io_access.Port;
+        self.whp_context.borrow_mut().io_access_data.io_data_len = io_access.AccessSize as usize;
+
+        let src = &io_access.Data as *const _ as *const u8;
+        let dst = self.whp_context.borrow_mut().io_access_data.io_data.as_mut_ptr();
+        let size_bytes = io_access.AccessSize as usize;
+
+        // Manually copy the data itself.
+        //
+        // Safe because the API guarantees that the Data stores in the IO access
+        // has side AccessSize in bytes and we've already checked that the size
+        // is less that the size of our destination buffer
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, dst, size_bytes);
+        }
+
+        S_OK
+    }
+
+    fn memory(
+        &mut self,
+        memory_access: &mut WHV_EMULATOR_MEMORY_ACCESS_INFO,
+    ) -> HRESULT {
+        // TODO: Update this to actually read or write mapped memory.
+        // For VcpuExit, needs:
+        // - Address (both physical and virtual addresses in context)
+        // - Data (only available from in emulator callback)
+        // - Access type (available in context)
+
+
+        S_OK
+    }
+
+    fn get_virtual_processor_registers(
+        &mut self,
+        register_names: &[WHV_REGISTER_NAME],
+        register_values: &mut [WHV_REGISTER_VALUE],
+    ) -> HRESULT {
+        self.vp
+            .borrow()
+            .get_registers(register_names, register_values)
+            .unwrap();
+        S_OK
+    }
+
+    fn set_virtual_processor_registers(
+        &mut self,
+        register_names: &[WHV_REGISTER_NAME],
+        register_values: &[WHV_REGISTER_VALUE],
+    ) -> HRESULT {
+        self.vp
+            .borrow()
+            .set_registers(register_names, register_values)
+            .unwrap();
+        S_OK
+    }
+
+    fn translate_gva_page(
+        &mut self,
+        gva: WHV_GUEST_VIRTUAL_ADDRESS,
+        translate_flags: WHV_TRANSLATE_GVA_FLAGS,
+        translation_result: &mut WHV_TRANSLATE_GVA_RESULT_CODE,
+        gpa: &mut WHV_GUEST_PHYSICAL_ADDRESS,
+    ) -> HRESULT {
+        let (translation_result1, gpa1) = self
+            .vp
+            .borrow()
+            .translate_gva(gva, translate_flags)
+            .unwrap();
+        *translation_result = translation_result1.ResultCode;
+        *gpa = gpa1;
+        S_OK
     }
 }
 
