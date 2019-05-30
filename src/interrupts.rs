@@ -23,6 +23,7 @@ use std::mem;
 use std::result;
 
 use vmm_vcpu::vcpu::{Vcpu, LapicState};
+use platform::VirtualProcessor;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -73,14 +74,14 @@ pub fn set_lapic_reg(lapic: &mut LapicState, reg_offset: APIC_REG_OFFSET, value:
     writer.write_u32::<LittleEndian>(value).unwrap()
 }
 
-pub fn get_reg_from_lapic<T: Vcpu>(vcpu: &T, reg_offset: APIC_REG_OFFSET) -> u32 {
+pub fn get_reg_from_lapic(vcpu: &VirtualProcessor, reg_offset: APIC_REG_OFFSET) -> u32 {
     //let lapic: LapicState = vcpu.get_lapic().map_err(Error::GetLapic).unwrap();
     let lapic: LapicState = vcpu.get_lapic().unwrap();
 
     get_lapic_reg(&lapic, reg_offset)
 }
 
-pub fn set_reg_in_lapic<T: Vcpu>(vcpu: &T, reg_offset: APIC_REG_OFFSET, value: u32) {
+pub fn set_reg_in_lapic(vcpu: &VirtualProcessor, reg_offset: APIC_REG_OFFSET, value: u32) {
     let mut lapic: LapicState = vcpu.get_lapic().unwrap();
 
     set_lapic_reg(&mut lapic, reg_offset, value);

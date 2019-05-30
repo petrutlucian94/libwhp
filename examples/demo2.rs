@@ -13,12 +13,22 @@
 // License for the specific language governing permissions and limitations
 // under the License.
 
+///
+/// This demo uses the WhpVirtualProcessor, and its underlying implementation
+/// of the Vcpu trait, as the virtual processor of the virtual machine
+///
+
+
 extern crate libc;
 extern crate libwhp;
+extern crate vmm_vcpu;
 
 use libwhp::instruction_emulator::*;
 use libwhp::memory::*;
+use libwhp::whp_vcpu::*;
 use libwhp::*;
+
+use vmm_vcpu::vcpu::Vcpu;
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -84,28 +94,21 @@ fn main() {
         )
         .unwrap();
 
-    let mut vp = p.create_virtual_processor(0).unwrap();
+    let vcpu = WhpVirtualProcessor::create_whp_vcpu_by_partition(p, 0).unwrap();
 
-    setup_long_mode(&mut vp, &payload_mem);
+    setup_long_mode(&mut vcpu.vp.borrow_mut(), &payload_mem);
     read_payload(&mut payload_mem);
-
-    let vp_ref_cell = RefCell::new(vp);
-
-    let mut callbacks = SampleCallbacks {
-        vp_ref_cell: &vp_ref_cell,
-    };
-
-    let mut e = Emulator::<SampleCallbacks>::new().unwrap();
 
     if cpu_info.apic_enabled {
         // Set the APIC base and send an interrupt to the VCPU
-        set_apic_base(&mut vp_ref_cell.borrow_mut());
-        send_ipi(&mut vp_ref_cell.borrow_mut(), INT_VECTOR);
-        set_delivery_notifications(&mut vp_ref_cell.borrow_mut());
+        set_apic_base(&mut vcpu.vp.borrow_mut());
+        send_ipi(&mut vcpu.vp.borrow_mut(), INT_VECTOR);
+        set_delivery_notifications(&mut vcpu.vp.borrow_mut());
     }
 
+/*
     loop {
-        let exit_context = vp_ref_cell.borrow_mut().run().unwrap();
+        let exit_context = vcpu.run().unwrap();
 
         match exit_context.ExitReason {
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => {
@@ -116,16 +119,16 @@ fn main() {
                 break;
             }
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
-                handle_mmio_exit(&mut e, &mut callbacks, &exit_context)
+                //handle_mmio_exit(&mut e, &mut callbacks, &exit_context)
             }
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
                 handle_io_port_exit(&mut e, &mut callbacks, &exit_context)
             }
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => {
-                handle_cpuid_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
+                handle_cpuid_exit(&mut vcpu.vp.borrow_mut(), &exit_context)
             }
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => {
-                handle_msr_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
+                handle_msr_exit(&mut vcpu.vp.borrow_mut(), &exit_context)
             }
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => {
                 println!("ApicEoi");
@@ -144,11 +147,12 @@ fn main() {
         // etc), teriminate the VCPU execution loop when both interrupts we're
         // expecting have been received. Plus we get to exercise the new
         // counter APIs.
-        if all_interrupts_received(&vp_ref_cell.borrow()) {
+        if all_interrupts_received(&vcpu.vp.borrow()) {
             println!("All interrupts received. All done!");
             break;
         }
     }
+    */
 }
 
 /*

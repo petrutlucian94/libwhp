@@ -169,7 +169,6 @@ impl Partition {
         Ok(VirtualProcessor {
             partition: Rc::clone(&self.partition),
             index: index,
-            exit_context: exit_context,
         })
     }
 
@@ -236,7 +235,6 @@ impl Drop for GPARangeMapping {
 pub struct VirtualProcessor {
     partition: Rc<RefCell<PartitionHandle>>,
     index: UINT32,
-    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
 }
 
 impl VirtualProcessor {
@@ -244,11 +242,7 @@ impl VirtualProcessor {
         return self.index;
     }
 
-    pub fn last_exit_context(&self) -> WHV_RUN_VP_EXIT_CONTEXT {
-        return self.exit_context;
-    }
-
-    pub fn do_run(&mut self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
+    pub fn run(&self) -> Result<WHV_RUN_VP_EXIT_CONTEXT, WHPError> {
         let mut exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
         let exit_context_size = std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as UINT32;
 
@@ -260,8 +254,6 @@ impl VirtualProcessor {
                 exit_context_size,
             )
         })?;
-
-        self.exit_context = exit_context;
 
         Ok(exit_context)
     }
@@ -361,7 +353,7 @@ impl VirtualProcessor {
         Ok(bitmap)
     }
 
-    pub fn get_lapic_state(&self) -> Result<LapicState, WHPError> {
+    pub fn get_lapic(&self) -> Result<LapicState, WHPError> {
         let mut state: LapicState = Default::default();
         let mut written_size: UINT32 = 0;
 
@@ -377,7 +369,7 @@ impl VirtualProcessor {
         Ok(state)
     }
 
-    pub fn set_lapic_state(&self, state: &LapicState) -> Result<(), WHPError> {
+    pub fn set_lapic(&self, state: &LapicState) -> Result<(), WHPError> {
         check_result(unsafe {
             WHvSetVirtualProcessorInterruptControllerState(
                 *self.partition.borrow().handle(),
@@ -638,7 +630,7 @@ mod tests {
 
         let vp_index: UINT32 = 0;
         let vp = p.create_virtual_processor(vp_index).unwrap();
-        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = vp.do_run().unwrap();
+        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = vp.run().unwrap();
 
         assert_eq!(
             exit_context.ExitReason,
@@ -849,14 +841,14 @@ mod tests {
         let vp = p.create_virtual_processor(vp_index).unwrap();
 
         if apic_enabled == true {
-            let state: LapicState = vp.get_lapic_state().unwrap();
+            let state: LapicState = vp.get_lapic().unwrap();
             let icr0 = get_lapic_reg(&state, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0);
 
             // Uses both get_lapic and set_lapic under the hood
             set_reg_in_lapic(&vp, APIC_REG_OFFSET::InterruptCommand0, 0x40);
 
-            let state_out: LapicState = vp.get_lapic_state().unwrap();
+            let state_out: LapicState = vp.get_lapic().unwrap();
             let icr0 = get_lapic_reg(&state_out, APIC_REG_OFFSET::InterruptCommand0);
             assert_eq!(icr0, 0x40);
         }

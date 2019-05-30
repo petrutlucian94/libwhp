@@ -33,6 +33,7 @@ pub struct WhpIoAccessData {
     io_data: [u8; 8],
     io_data_len: usize,
     port: u16,
+    is_write: u8,
 }
 
 impl Default for WhpIoAccessData {
@@ -42,9 +43,10 @@ impl Default for WhpIoAccessData {
 }
 
 pub struct WhpMmioAccessData {
-    io_data: [u8; 8],
-    io_data_len: usize,
+    mmio_data: [u8; 8],
+    mmio_data_len: usize,
     gpa: u64,
+    is_write: u8,
 }
 
 impl Default for WhpMmioAccessData {
@@ -72,8 +74,8 @@ pub struct WhpVirtualProcessor {
 }
 
 impl WhpVirtualProcessor {
-    pub fn create_whp_vcpu(vp: VirtualProcessor) -> Self {
-        return WhpVirtualProcessor {
+    pub fn create_whp_vcpu(vp: VirtualProcessor) -> VcpuResult<Self> {
+        return Ok(WhpVirtualProcessor {
             vp: RefCell::new(vp),
             emulator: Emulator::<Self>::new().unwrap(),
             whp_context: RefCell::new(WhpContext {
@@ -81,7 +83,21 @@ impl WhpVirtualProcessor {
                 io_access_data: Default::default(),
                 mmio_access_data: Default::default(),
             })
-        };
+        });
+    }
+
+    pub fn create_whp_vcpu_by_partition(p: Partition, index: UINT32) -> VcpuResult<Self> {
+        let vp = p.create_virtual_processor(index).unwrap();
+
+        return Ok(WhpVirtualProcessor {
+            vp: RefCell::new(vp),
+            emulator: Emulator::<Self>::new().unwrap(),
+            whp_context: RefCell::new(WhpContext {
+                last_exit_context: Default::default(),
+                io_access_data: Default::default(),
+                mmio_access_data: Default::default(),
+            })
+        });
     }
 }
 
@@ -380,12 +396,41 @@ impl Vcpu for WhpVirtualProcessor {
 
     fn run(&self) -> VcpuResult<VcpuExit> {
 
+        let mut whp_context = self.whp_context.borrow_mut();
+
+        // In the case of MMIO and IO Port reads, we do not actually fill in the
+        // data within the appropriate callbacks, as would normally be done. We
+        // instead capture the necessary information (GPA or Port, respectively),
+        // after performing a first round of IO port or MMIO emulation,
+        // and pass it back via the whp_context to the VMM that is consuming
+        // this VCPU, which will perform the actual read. The VMM will plug that
+        // returned read data back into the whp_context, and another invocation
+        // of the emulation will fill it in.
+
+
+        // Here we have that chronologically "second" round of emulation. By this
+        // point, the VMM is calling run() again, but the data from the last round
+        // of MMIO or IO port read is stored in the whp_context. This code will
+        // only be entered for read accesses of MMIO or IO Port operations.
+        match whp_context.last_exit_context.ExitReason {
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
+            }
+
+            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
+                let io_port_access_ctx = 
+                    unsafe { whp_context.last_exit_context.anon_union.IoPortAccess };
+
+                let vp_context = whp_context.last_exit_context.VpContext;
+            }
+            _ => {}
+        };
+
         // In the case of an MMIO or IO Port read, the guest physical address
         // or port (respectively) will be recorded by the MMIO and IO Port
         // emulation callbacks (respectively). This data will be returned to
         // the caller VMM in the VpuExit value, along with pointers to where
         // the data should actually be written after the MMIO or IO port read
-        // performed by the VMM. Before calling do_run() on the VirtualProcessor
+        // performed by the VMM. Before calling run() on the VirtualProcessor
         // again, this function will emulate the MMIO or IO Port read again,
         // actually storing the data in the byte array that the hypervisor
         // will return to the guest. Thus, in the read case, there are two calls
@@ -395,13 +440,8 @@ impl Vcpu for WhpVirtualProcessor {
 
         // Chronologically "second" emulation, which closes the loop by supplying
         // the read data requested by the previous run
-        //let prev_exit_reason = self.
 
-        //let exit_context = self.vp.borrow_mut().do_run().unwrap();
-        //self.last_exit_context = self.vp.borrow_mut().do_run().unwrap();
-        let exit_context = self.vp.borrow_mut().do_run().unwrap();
-        //self.last_exit_context = exit_context;
-
+        let exit_context = self.vp.borrow().run().unwrap();
         let exit_reason = 
             match exit_context.ExitReason {
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::Unknown,
@@ -438,13 +478,13 @@ impl Vcpu for WhpVirtualProcessor {
     }
 
     fn get_lapic(&self) -> VcpuResult<LapicState> {
-        let state: LapicState = self.vp.borrow().get_lapic_state()
+        let state: LapicState = self.vp.borrow().get_lapic()
                     .map_err(|_| io::Error::last_os_error())?;
         Ok(state)
     }
 
     fn set_lapic(&self, klapic: &LapicState) -> VcpuResult<()> {
-        self.vp.borrow().set_lapic_state(klapic)
+        self.vp.borrow().set_lapic(klapic)
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
@@ -461,18 +501,34 @@ impl EmulatorCallbacks for WhpVirtualProcessor {
                 (io_access.AccessSize == 2) ||
                 (io_access.AccessSize == 4));
 
-        // Copy the IO Port Access data to the WhpVirtualProcessor state
-        self.whp_context.borrow_mut().io_access_data.port = io_access.Port;
-        self.whp_context.borrow_mut().io_access_data.io_data_len = io_access.AccessSize as usize;
-
-        let src = &io_access.Data as *const _ as *const u8;
-        let dst = self.whp_context.borrow_mut().io_access_data.io_data.as_mut_ptr();
+        let mut whp_context = self.whp_context.borrow_mut();
+        let is_write = io_access.Direction;
         let size_bytes = io_access.AccessSize as usize;
 
-        // Manually copy the data itself.
-        //
-        // Safe because the API guarantees that the Data stores in the IO access
-        // has side AccessSize in bytes and we've already checked that the size
+        let src: *const u8;
+        let dst: *mut u8;
+
+        if is_write == 1 {
+            // Copy the port and data to the WhpIoAccessData in the WHP context
+            // so that the calling VMM can write it out
+            whp_context.io_access_data.port = io_access.Port;
+            whp_context.io_access_data.io_data_len = size_bytes;
+            whp_context.io_access_data.is_write = is_write;
+
+            // Manually copy the data itself.
+            src = &io_access.Data as *const _ as *const u8;
+            dst = whp_context.io_access_data.io_data.as_mut_ptr();
+        }
+        else {
+            // The calling VMM has performed the read, supply that data to the 
+            // WHV_EMULATOR_IO_ACCESS_INFO Data to complete the read for the 
+            // guest
+            src = whp_context.io_access_data.io_data.as_ptr();
+            dst = &mut io_access.Data as *mut _ as *mut u8;
+        }
+
+        // Safe because the API guarantees that the Data stored in the IO access
+        // has size AccessSize in bytes and we've already checked that the size
         // is less that the size of our destination buffer
         unsafe {
             std::ptr::copy_nonoverlapping(src, dst, size_bytes);
@@ -485,12 +541,41 @@ impl EmulatorCallbacks for WhpVirtualProcessor {
         &mut self,
         memory_access: &mut WHV_EMULATOR_MEMORY_ACCESS_INFO,
     ) -> HRESULT {
-        // TODO: Update this to actually read or write mapped memory.
-        // For VcpuExit, needs:
-        // - Address (both physical and virtual addresses in context)
-        // - Data (only available from in emulator callback)
-        // - Access type (available in context)
 
+        assert!((memory_access.AccessSize > 0) &&
+                (memory_access.AccessSize <= 8));
+
+        let mut whp_context = self.whp_context.borrow_mut();
+        let is_write = memory_access.Direction;
+        let size_bytes = memory_access.AccessSize as usize;
+    
+        let src: *const u8;
+        let dst: *mut u8;
+
+        if is_write == 1 {
+            // Copy the guest physical address and data to the WhpMmioAccessData
+            // in the WHP context so that the calling VMM can write it out
+            whp_context.mmio_access_data.gpa = memory_access.GpaAddress;
+            whp_context.mmio_access_data.mmio_data_len = size_bytes;
+            whp_context.mmio_access_data.is_write = is_write;
+
+            src = &memory_access.Data as *const _ as *const u8;
+            dst = whp_context.mmio_access_data.mmio_data.as_mut_ptr();
+        }
+        else {
+            // The calling VMM has performed the read; supply that data to the
+            // WHV_EMULATOR_MEMORY_ACCESS_INFO Data to complete the read for the
+            // guest
+            src = whp_context.mmio_access_data.mmio_data.as_ptr();
+            dst = &mut memory_access.Data as *mut _ as *mut u8;
+        }
+
+        // Safe because the API guarantees that the Data stored in the IO access
+        // has size AccessSize in bytes and we've already checked that the size
+        // is less that the size of our destination buffer
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, dst, size_bytes);
+        }
 
         S_OK
     }
@@ -537,34 +622,6 @@ impl EmulatorCallbacks for WhpVirtualProcessor {
     }
 }
 
-/*
-pub struct WhpVcpu<T: EmulatorCallbacks> {
-    vp: VirtualProcessor,
-    emulator: Emulator<T>,
-    exit_context: WHV_RUN_VP_EXIT_CONTEXT,
-    io_data: [u8; 8],
-    io_data_len: usize,
-}
-
-impl<T: EmulatorCallbacks> WhpVcpu<T> {
-    fn new(
-        id: UINT32,
-        partition: Partition,
-        emulator_callbacks: T,
-    ) -> Self {
-        let vp = partition.create_virtual_processor(id).unwrap();
-
-        return WhpVcpu {
-            vp: vp,
-            emulator: Emulator::<T>::new().unwrap(),
-            exit_context: Default::default(),
-            io_data: Default::default(),
-            io_data_len: 0,
-        }
-    }
-}
-*/
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,7 +648,7 @@ mod tests {
         setup_vcpu_test(&mut p);
 
         let vp_index: UINT32 = 0;
-        let vp = p.create_virtual_processor(vp_index).unwrap();
+        let vcpu = WhpVirtualProcessor::create_whp_vcpu_by_partition(p, vp_index).unwrap();
 
         let std_regs_in = StandardRegisters {
             rax: 0xabcd0000abcd0000,
@@ -614,8 +671,8 @@ mod tests {
             rflags: 0xabcd0000abcd0011,
         };
 
-        vp.set_regs(&std_regs_in).unwrap();
-        let std_regs_out = vp.get_regs().unwrap();
+        vcpu.set_regs(&std_regs_in).unwrap();
+        let std_regs_out = vcpu.get_regs().unwrap();
 
         assert_eq!(
             std_regs_in, std_regs_out,
@@ -630,9 +687,10 @@ mod tests {
 
         let vp_index: UINT32 = 0;
         let vp = p.create_virtual_processor(vp_index).unwrap();
+        let vcpu = WhpVirtualProcessor::create_whp_vcpu(vp).unwrap();
 
         // Get the initial set of special registers
-        let mut sregs = vp.get_sregs().unwrap();
+        let mut sregs = vcpu.get_sregs().unwrap();
 
         // Make some modifications to them
         sregs.cs.limit = 0xffff;
@@ -648,41 +706,13 @@ mod tests {
         sregs.apic_base = 0xa0000000;
 
         // Set the modified values
-        vp.set_sregs(&sregs).unwrap();
-        let std_regs_out = vp.get_sregs().unwrap();
+        vcpu.set_sregs(&sregs).unwrap();
+        let std_regs_out = vcpu.get_sregs().unwrap();
 
         assert_eq!(
             sregs, std_regs_out,
             "SpecialRegister values set and gotten do not match"
         );
-    }
-
-    #[ignore]
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_set_cpuid2() {
-        const CPUID_EXT_HYPERVISOR: UINT32 = 1 << 31;
-
-        let mut p: Partition = Partition::new().unwrap();
-        setup_vcpu_test(&mut p);
-
-        let vp_index: UINT32 = 0;
-        let vp = p.create_virtual_processor(vp_index).unwrap();
-
-        // Create a VCPU array
-        let mut cpuid = CpuId::new(0);
-        cpuid.push(CpuIdEntry2 {
-            function: 1,
-            index: 0,
-            flags: 0,
-            eax: 0,
-            ebx: 0,
-            ecx: CPUID_EXT_HYPERVISOR,
-            edx: 0,
-            padding: [0, 0, 0]
-        }).unwrap();
-
-        vp.set_cpuid2(&cpuid).unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -692,7 +722,7 @@ mod tests {
         setup_vcpu_test(&mut p);
 
         let vp_index: UINT32 = 0;
-        let vp = p.create_virtual_processor(vp_index).unwrap();
+        let vcpu = WhpVirtualProcessor::create_whp_vcpu_by_partition(p, vp_index).unwrap();
 
         let entries = [
             MsrEntry {
@@ -746,7 +776,7 @@ mod tests {
                 "Failure converting/copying MSR entry[1].data");
         }
 
-        vp.set_msrs(msrs).unwrap();
+        vcpu.set_msrs(msrs).unwrap();
 
         // Now test getting the data back
         let out_entries = [
@@ -779,7 +809,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(src, dst, out_entries_bytes);
         }
 
-        vp.get_msrs(&mut out_msrs).unwrap();
+        vcpu.get_msrs(&mut out_msrs).unwrap();
 
         assert_eq!(msrs.nmsrs, out_msrs.nmsrs, "Mismatch between number of get and set MSRs");
 
