@@ -56,6 +56,7 @@ impl Default for WhpMmioAccessData {
 }
 
 pub struct WhpContext {
+    vp: VirtualProcessor,
     last_exit_context: WHV_RUN_VP_EXIT_CONTEXT,
     io_access_data: WhpIoAccessData,
     mmio_access_data: WhpMmioAccessData,
@@ -68,17 +69,16 @@ impl WhpContext {
 }
 
 pub struct WhpVirtualProcessor {
-    pub vp: RefCell<VirtualProcessor>,
-    emulator: Emulator<Self>,
+    emulator: Emulator<WhpContext>,
     whp_context: RefCell<WhpContext>,
 }
 
 impl WhpVirtualProcessor {
     pub fn create_whp_vcpu(vp: VirtualProcessor) -> VcpuResult<Self> {
         return Ok(WhpVirtualProcessor {
-            vp: RefCell::new(vp),
-            emulator: Emulator::<Self>::new().unwrap(),
+            emulator: Emulator::<WhpContext>::new().unwrap(),
             whp_context: RefCell::new(WhpContext {
+                vp: vp,
                 last_exit_context: Default::default(),
                 io_access_data: Default::default(),
                 mmio_access_data: Default::default(),
@@ -90,15 +90,59 @@ impl WhpVirtualProcessor {
         let vp = p.create_virtual_processor(index).unwrap();
 
         return Ok(WhpVirtualProcessor {
-            vp: RefCell::new(vp),
-            emulator: Emulator::<Self>::new().unwrap(),
+            emulator: Emulator::<WhpContext>::new().unwrap(),
             whp_context: RefCell::new(WhpContext {
+                vp: vp,
                 last_exit_context: Default::default(),
                 io_access_data: Default::default(),
                 mmio_access_data: Default::default(),
             })
         });
     }
+
+    pub fn handle_io_port_exit(&self, whp_context: &mut WhpContext) -> Result<(), WHPError> {
+        let vp_context = whp_context.last_exit_context.VpContext;
+        let io_port_access_ctx =
+            unsafe { whp_context.last_exit_context.anon_union.IoPortAccess };
+
+        let _status = self
+            .emulator
+            .try_io_emulation(whp_context, &vp_context, &io_port_access_ctx)?;
+        
+        Ok(())
+    }
+
+    pub fn handle_mmio_exit(&self, whp_context: &mut WhpContext) -> Result<(), WHPError> {
+        let vp_context = whp_context.last_exit_context.VpContext;
+        let mmio_access_ctx =
+            unsafe {whp_context.last_exit_context.anon_union.MemoryAccess };
+
+        let _status = self
+            .emulator
+            .try_mmio_emulation(whp_context, &vp_context, &mmio_access_ctx)
+            .unwrap();
+        
+        Ok(())
+    }
+
+    /// Use request_interrupt to inject the specified interrupt vector.
+    pub fn interrupt(&self, irq: UINT32) -> VcpuResult<()> {
+        let mut interrupt: WHV_INTERRUPT_CONTROL = Default::default();
+
+        interrupt.set_InterruptType(
+            WHV_INTERRUPT_TYPE::WHvX64InterruptTypeFixed as UINT64);
+        interrupt.set_DestinationMode(
+            WHV_INTERRUPT_DESTINATION_MODE::WHvX64InterruptDestinationModePhysical as UINT64);
+        interrupt.set_TriggerMode(
+            WHV_INTERRUPT_TRIGGER_MODE::WHvX64InterruptTriggerModeEdge as UINT64);
+        interrupt.Destination = 0;
+        interrupt.Vector = irq;
+
+        self.whp_context.borrow().vp.request_interrupt(&mut interrupt).unwrap();
+
+        Ok(())
+    }
+
 }
 
 impl Vcpu for WhpVirtualProcessor {
@@ -113,8 +157,9 @@ impl Vcpu for WhpVirtualProcessor {
     fn get_regs(&self) -> VcpuResult<StandardRegisters> {
         let mut win_regs: WinStandardRegisters = Default::default();
 
-        self.vp
+        self.whp_context
             .borrow()
+            .vp
             .get_registers(&win_regs.names, &mut win_regs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
@@ -171,8 +216,9 @@ impl Vcpu for WhpVirtualProcessor {
         win_regs.values[WinStandardRegIndex::Rip as usize].Reg64 = regs.rip;
         win_regs.values[WinStandardRegIndex::Rflags as usize].Reg64 = regs.rflags;
 
-        self.vp
+        self.whp_context
             .borrow()
+            .vp
             .set_registers(&win_regs.names, &win_regs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
@@ -182,8 +228,9 @@ impl Vcpu for WhpVirtualProcessor {
     fn get_sregs(&self) -> VcpuResult<SpecialRegisters> {
         let mut win_sregs: WinSpecialRegisters = Default::default();
 
-        self.vp
+        self.whp_context
             .borrow()
+            .vp
             .get_registers(&win_sregs.names, &mut win_sregs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
@@ -257,8 +304,9 @@ impl Vcpu for WhpVirtualProcessor {
         win_sregs.values[WinSpecialRegIndex::Efer as usize].Reg64 = sregs.efer;
         win_sregs.values[WinSpecialRegIndex::ApicBase as usize].Reg64 = sregs.apic_base;
 
-        self.vp
+        self.whp_context
             .borrow()
+            .vp
             .set_registers(&win_sregs.names, &win_sregs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
@@ -269,8 +317,9 @@ impl Vcpu for WhpVirtualProcessor {
         let mut fregs: WinFpuRegisters = Default::default();
 
         // Get the registers from the vCPU
-        self.vp
+        self.whp_context
             .borrow()
+            .vp
             .get_registers(&fregs.names, &mut fregs.values)
             .map_err(|_| io::Error::last_os_error())?;
 
@@ -283,8 +332,9 @@ impl Vcpu for WhpVirtualProcessor {
     fn set_fpu(&self, fpu: &FpuState) -> VcpuResult<()> {
         let fregs: WinFpuRegisters = ConvertFpuState::from_portable(&fpu);
 
-        self.vp
+        self.whp_context
             .borrow()
+            .vp
             .set_registers(&fregs.names, &fregs.values)
             .map_err(|_| io::Error::last_os_error()).unwrap();
         Ok(())
@@ -355,8 +405,9 @@ impl Vcpu for WhpVirtualProcessor {
         }
 
         // Get the MSR values
-        self.vp
+        self.whp_context
             .borrow()
+            .vp
             .get_registers(&msr_names, &mut msr_values)
             .map_err(|_| io::Error::last_os_error())?;
         
@@ -386,8 +437,9 @@ impl Vcpu for WhpVirtualProcessor {
             }
         }
 
-        self.vp
+        self.whp_context
             .borrow()
+            .vp
             .set_registers(&msr_names, &msr_values)
             .map_err(|_| io::Error::last_os_error())?;
 
@@ -407,20 +459,22 @@ impl Vcpu for WhpVirtualProcessor {
         // returned read data back into the whp_context, and another invocation
         // of the emulation will fill it in.
 
-
-        // Here we have that chronologically "second" round of emulation. By this
-        // point, the VMM is calling run() again, but the data from the last round
-        // of MMIO or IO port read is stored in the whp_context. This code will
-        // only be entered for read accesses of MMIO or IO Port operations.
         match whp_context.last_exit_context.ExitReason {
+            // Here we have that chronologically "second" round of emulation for
+            // MMIO and IO port reads only. By this point, the VMM is calling
+            // run() again, but the data from the last round of MMIO or IO port
+            // read is stored in the whp_context. This code will only be entered
+            // for read accesses of MMIO or IO Port operations.
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
+                if whp_context.mmio_access_data.is_write == 0 {
+                    self.handle_mmio_exit(&mut whp_context);
+                }
             }
 
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
-                let io_port_access_ctx = 
-                    unsafe { whp_context.last_exit_context.anon_union.IoPortAccess };
-
-                let vp_context = whp_context.last_exit_context.VpContext;
+                if whp_context.io_access_data.is_write == 0 {
+                    self.handle_io_port_exit(&mut whp_context);
+                }
             }
             _ => {}
         };
@@ -441,15 +495,38 @@ impl Vcpu for WhpVirtualProcessor {
         // Chronologically "second" emulation, which closes the loop by supplying
         // the read data requested by the previous run
 
-        let exit_context = self.vp.borrow().run().unwrap();
+        whp_context.last_exit_context = whp_context.vp.run().unwrap();
+
         let exit_reason = 
-            match exit_context.ExitReason {
+            match whp_context.last_exit_context.ExitReason {
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::Unknown,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
                     VcpuExit::MemoryAccess
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
-                    VcpuExit::IoPortAccess
+                    self.handle_io_port_exit(&mut whp_context);
+                    let io_data_ptr = whp_context.io_access_data.io_data.as_mut_ptr();
+
+                    let size = whp_context.io_access_data.io_data_len;
+
+                    let mut io_data: &mut [u8];
+
+                    unsafe {
+                        io_data = std::slice::from_raw_parts_mut( io_data_ptr, size);
+                    }
+
+                    if whp_context.io_access_data.is_write == 0 {
+                        return Ok(VcpuExit::IoIn(
+                            whp_context.io_access_data.port,
+                            io_data,
+                        ));
+                    }
+                    else {
+                        return Ok(VcpuExit::IoOut(
+                            whp_context.io_access_data.port,
+                            io_data,
+                        ));
+                    }
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnrecoverableException => {
                     VcpuExit::Exception
@@ -472,26 +549,24 @@ impl Vcpu for WhpVirtualProcessor {
                 _ => VcpuExit::Unknown,
             };
 
-        self.whp_context.borrow_mut().last_exit_context = exit_context;
-
         Ok(exit_reason)
     }
 
     fn get_lapic(&self) -> VcpuResult<LapicState> {
-        let state: LapicState = self.vp.borrow().get_lapic()
+        let state: LapicState = self.whp_context.borrow().vp.get_lapic()
                     .map_err(|_| io::Error::last_os_error())?;
         Ok(state)
     }
 
     fn set_lapic(&self, klapic: &LapicState) -> VcpuResult<()> {
-        self.vp.borrow().set_lapic(klapic)
+        self.whp_context.borrow().vp.set_lapic(klapic)
             .map_err(|_| io::Error::last_os_error())?;
 
         Ok(())
     }
 }
 
-impl EmulatorCallbacks for WhpVirtualProcessor {
+impl EmulatorCallbacks for WhpContext {
     fn io_port(
         &mut self,
         io_access: &mut WHV_EMULATOR_IO_ACCESS_INFO,
@@ -501,29 +576,28 @@ impl EmulatorCallbacks for WhpVirtualProcessor {
                 (io_access.AccessSize == 2) ||
                 (io_access.AccessSize == 4));
 
-        let mut whp_context = self.whp_context.borrow_mut();
         let is_write = io_access.Direction;
         let size_bytes = io_access.AccessSize as usize;
 
         let src: *const u8;
         let dst: *mut u8;
 
-        if is_write == 1 {
-            // Copy the port and data to the WhpIoAccessData in the WHP context
-            // so that the calling VMM can write it out
-            whp_context.io_access_data.port = io_access.Port;
-            whp_context.io_access_data.io_data_len = size_bytes;
-            whp_context.io_access_data.is_write = is_write;
+        // Copy the port and data to the WhpIoAccessData in the WHP context
+        // so that the calling VMM knows what to read/write
+        self.io_access_data.port = io_access.Port;
+        self.io_access_data.io_data_len = size_bytes;
+        self.io_access_data.is_write = is_write;
 
+        if is_write == 1 {
             // Manually copy the data itself.
             src = &io_access.Data as *const _ as *const u8;
-            dst = whp_context.io_access_data.io_data.as_mut_ptr();
+            dst = self.io_access_data.io_data.as_mut_ptr();
         }
         else {
             // The calling VMM has performed the read, supply that data to the 
             // WHV_EMULATOR_IO_ACCESS_INFO Data to complete the read for the 
             // guest
-            src = whp_context.io_access_data.io_data.as_ptr();
+            src = self.io_access_data.io_data.as_ptr();
             dst = &mut io_access.Data as *mut _ as *mut u8;
         }
 
@@ -545,28 +619,27 @@ impl EmulatorCallbacks for WhpVirtualProcessor {
         assert!((memory_access.AccessSize > 0) &&
                 (memory_access.AccessSize <= 8));
 
-        let mut whp_context = self.whp_context.borrow_mut();
         let is_write = memory_access.Direction;
         let size_bytes = memory_access.AccessSize as usize;
     
         let src: *const u8;
         let dst: *mut u8;
 
-        if is_write == 1 {
-            // Copy the guest physical address and data to the WhpMmioAccessData
-            // in the WHP context so that the calling VMM can write it out
-            whp_context.mmio_access_data.gpa = memory_access.GpaAddress;
-            whp_context.mmio_access_data.mmio_data_len = size_bytes;
-            whp_context.mmio_access_data.is_write = is_write;
+        // Copy the guest physical address and data to the WhpMmioAccessData
+        // in the WHP context so that the calling VMM knows what to read/write
+        self.mmio_access_data.gpa = memory_access.GpaAddress;
+        self.mmio_access_data.mmio_data_len = size_bytes;
+        self.mmio_access_data.is_write = is_write;
 
+        if is_write == 1 {
             src = &memory_access.Data as *const _ as *const u8;
-            dst = whp_context.mmio_access_data.mmio_data.as_mut_ptr();
+            dst = self.mmio_access_data.mmio_data.as_mut_ptr();
         }
         else {
             // The calling VMM has performed the read; supply that data to the
             // WHV_EMULATOR_MEMORY_ACCESS_INFO Data to complete the read for the
             // guest
-            src = whp_context.mmio_access_data.mmio_data.as_ptr();
+            src = self.mmio_access_data.mmio_data.as_ptr();
             dst = &mut memory_access.Data as *mut _ as *mut u8;
         }
 
@@ -586,7 +659,6 @@ impl EmulatorCallbacks for WhpVirtualProcessor {
         register_values: &mut [WHV_REGISTER_VALUE],
     ) -> HRESULT {
         self.vp
-            .borrow()
             .get_registers(register_names, register_values)
             .unwrap();
         S_OK
@@ -598,7 +670,6 @@ impl EmulatorCallbacks for WhpVirtualProcessor {
         register_values: &[WHV_REGISTER_VALUE],
     ) -> HRESULT {
         self.vp
-            .borrow()
             .set_registers(register_names, register_values)
             .unwrap();
         S_OK
@@ -613,7 +684,6 @@ impl EmulatorCallbacks for WhpVirtualProcessor {
     ) -> HRESULT {
         let (translation_result1, gpa1) = self
             .vp
-            .borrow()
             .translate_gva(gva, translate_flags)
             .unwrap();
         *translation_result = translation_result1.ResultCode;

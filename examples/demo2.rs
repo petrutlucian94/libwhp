@@ -29,6 +29,10 @@ use libwhp::whp_vcpu::*;
 use libwhp::*;
 
 use vmm_vcpu::vcpu::Vcpu;
+use vmm_vcpu::x86_64::{
+    StandardRegisters, SpecialRegisters, FpuState, MsrEntries, MsrEntry, 
+    CpuId, LapicState, CpuIdEntry2, SegmentRegister,
+};
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -94,16 +98,16 @@ fn main() {
         )
         .unwrap();
 
-    let vcpu = WhpVirtualProcessor::create_whp_vcpu_by_partition(p, 0).unwrap();
+    let mut vcpu = WhpVirtualProcessor::create_whp_vcpu_by_partition(p, 0).unwrap();
 
-    setup_long_mode(&mut vcpu.vp.borrow_mut(), &payload_mem);
+    setup_long_mode(&mut vcpu, &payload_mem);
     read_payload(&mut payload_mem);
 
     if cpu_info.apic_enabled {
         // Set the APIC base and send an interrupt to the VCPU
-        set_apic_base(&mut vcpu.vp.borrow_mut());
-        send_ipi(&mut vcpu.vp.borrow_mut(), INT_VECTOR);
-        set_delivery_notifications(&mut vcpu.vp.borrow_mut());
+        set_apic_base(&mut vcpu);
+        vcpu.interrupt(INT_VECTOR).unwrap();
+        //set_delivery_notifications(&mut vcpu.vp.borrow_mut());
     }
 
 /*
@@ -172,21 +176,16 @@ fn all_interrupts_received(vp: &VirtualProcessor) -> bool {
     }
 }
 
-fn set_apic_base(vp: &mut VirtualProcessor) {
+fn set_apic_base(vcpu: &mut WhpVirtualProcessor) {
     // Page table translations for this guest only cover the first 1GB of memory,
     // and the default APIC base falls above that. Set the APIC base to
     // something lower, within our range of virtual memory
 
-    // Get the default APIC base register value to start
-    const NUM_REGS: usize = 1;
-    let mut reg_names: [WHV_REGISTER_NAME; NUM_REGS] = Default::default();
-    let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS] = Default::default();
-
-    reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterApicBase;
-
-    // Get the registers as a baseline
-    vp.get_registers(&reg_names, &mut reg_values).unwrap();
-    let mut flags = unsafe { reg_values[0].Reg64 };
+    // Get the existing state of the standard registers
+    let mut sregs: SpecialRegisters = vcpu.get_sregs().unwrap();
+    
+    // Start with the default APIC base register value
+    let mut flags = sregs.apic_base;
 
     // Mask off the bottom 12 bits, which are used to store flags
     flags = flags & 0xfff;
@@ -194,63 +193,11 @@ fn set_apic_base(vp: &mut VirtualProcessor) {
     // Set the APIC base to something lower within our translatable address
     // space
     let new_apic_base = 0x0fee_0000;
-    reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterApicBase;
-    reg_values[0].Reg64 = new_apic_base | flags;
-    vp.set_registers(&reg_names, &reg_values).unwrap();
+    sregs.apic_base = new_apic_base | flags;
+    vcpu.set_sregs(&sregs).unwrap();
 }
 
-fn send_msi(vp: &mut VirtualProcessor, message: &WHV_MSI_ENTRY) {
-    let addr: UINT32 = unsafe { message.anon_struct.Address };
-    let data: UINT32 = unsafe { message.anon_struct.Data };
-
-    let dest = (addr & MSI_ADDR_DEST_ID_MASK) >> MSI_ADDR_DEST_ID_SHIFT;
-    let vector = (data & MSI_DATA_VECTOR_MASK) >> MSI_DATA_VECTOR_SHIFT;
-    let dest_mode = (addr >> MSI_ADDR_DEST_MODE_SHIFT) & 0x1;
-    let trigger_mode = (data >> MSI_DATA_TRIGGER_SHIFT) & 0x1;
-    let delivery = (data >> MSI_DATA_DELIVERY_MODE_SHIFT) & 0x7;
-
-    let mut interrupt: WHV_INTERRUPT_CONTROL = Default::default();
-
-    interrupt.set_InterruptType(delivery as UINT64);
-
-    if dest_mode == 0 {
-        interrupt.set_DestinationMode(
-            WHV_INTERRUPT_DESTINATION_MODE::WHvX64InterruptDestinationModePhysical as UINT64,
-        );
-    } else {
-        interrupt.set_DestinationMode(
-            WHV_INTERRUPT_DESTINATION_MODE::WHvX64InterruptDestinationModeLogical as UINT64,
-        );
-    }
-
-    interrupt.set_TriggerMode(trigger_mode as UINT64);
-
-    interrupt.Destination = dest;
-    interrupt.Vector = vector;
-
-    vp.request_interrupt(&mut interrupt).unwrap();
-}
-
-fn send_ipi(vp: &mut VirtualProcessor, vector: u32) {
-    println!("Send IPI from the host to the guest");
-
-    let mut message: WHV_MSI_ENTRY = Default::default();
-
-    // - Trigger mode is 'Edge'
-    // - Interrupt type is 'Fixed'
-    // - Destination mode is 'Physical'
-    // - Destination is 0. Since Destination Mode is Physical, bits 56-59
-    //   contain the APIC ID of the target processor (APIC ID = 0)
-    // Level = 1 and Destination Shorthand = 1, but the underlying API will
-    // actually ignore this.
-    unsafe {
-        message.anon_struct.Data = (0x00044000 | vector) as UINT32;
-        message.anon_struct.Address = 0;
-    }
-
-    send_msi(vp, &message);
-}
-
+/*
 fn set_delivery_notifications(vp: &mut VirtualProcessor) {
     const NUM_REGS: usize = 1;
     let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS] = Default::default();
@@ -262,6 +209,7 @@ fn set_delivery_notifications(vp: &mut VirtualProcessor) {
     reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterDeliverabilityNotifications;
     vp.set_registers(&reg_names, &reg_values).unwrap();
 }
+*/
 
 fn handle_msr_exit(vp: &mut VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) {
     let msr_access = unsafe { exit_context.anon_union.MsrAccess };
@@ -468,74 +416,74 @@ fn initialize_address_space(payload_mem: &VirtualMemory) -> u64 {
     pml4_addr
 }
 
-fn setup_long_mode(vp: &mut VirtualProcessor, payload_mem: &VirtualMemory) {
+fn setup_long_mode(vcpu: &mut WhpVirtualProcessor, payload_mem: &VirtualMemory) {
     let pml4_addr = initialize_address_space(payload_mem);
 
-    const NUM_REGS: UINT32 = 13;
-    let mut reg_names: [WHV_REGISTER_NAME; NUM_REGS as usize] = Default::default();
-    let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS as usize] = Default::default();
+    // Get the current state 
+    let mut regs: StandardRegisters = vcpu.get_regs().unwrap();
+    let mut sregs: SpecialRegisters = vcpu.get_sregs().unwrap();
 
-    // Setup paging
-    reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterCr3;
-    reg_values[0].Reg64 = pml4_addr;
-    reg_names[1] = WHV_REGISTER_NAME::WHvX64RegisterCr4;
-    reg_values[1].Reg64 = CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT;
-
-    reg_names[2] = WHV_REGISTER_NAME::WHvX64RegisterCr0;
-    reg_values[2].Reg64 = CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_WP | CR0_AM | CR0_PG;
-    reg_names[3] = WHV_REGISTER_NAME::WHvX64RegisterEfer;
-    reg_values[3].Reg64 = EFER_LME | EFER_LMA;
-
-    reg_names[4] = WHV_REGISTER_NAME::WHvX64RegisterCs;
-    unsafe {
-        let segment = &mut reg_values[4].Segment;
-        segment.Base = 0;
-        segment.Limit = 0xffffffff;
-        segment.Selector = 1 << 3;
-        segment.set_SegmentType(11);
-        segment.set_NonSystemSegment(1);
-        segment.set_Present(1);
-        segment.set_Long(1);
-        segment.set_Granularity(1);
-    }
-
-    reg_names[5] = WHV_REGISTER_NAME::WHvX64RegisterDs;
-    unsafe {
-        let segment = &mut reg_values[5].Segment;
-        segment.Base = 0;
-        segment.Limit = 0xffffffff;
-        segment.Selector = 2 << 3;
-        segment.set_SegmentType(3);
-        segment.set_NonSystemSegment(1);
-        segment.set_Present(1);
-        segment.set_Long(1);
-        segment.set_Granularity(1);
-    }
-
-    reg_names[6] = WHV_REGISTER_NAME::WHvX64RegisterEs;
-    reg_values[6] = reg_values[5];
-
-    reg_names[7] = WHV_REGISTER_NAME::WHvX64RegisterFs;
-    reg_values[7] = reg_values[5];
-
-    reg_names[8] = WHV_REGISTER_NAME::WHvX64RegisterGs;
-    reg_values[8] = reg_values[5];
-
-    reg_names[9] = WHV_REGISTER_NAME::WHvX64RegisterSs;
-    reg_values[9] = reg_values[5];
+    // Set the standard registers first by overwriting the ones we care about
+    // for setup
 
     // Start with the Interrupt Flag off; guest will enable it when ready
-    reg_names[10] = WHV_REGISTER_NAME::WHvX64RegisterRflags;
-    reg_values[10].Reg64 = 0x002;
+    regs.rflags = 0x002;
 
-    reg_names[11] = WHV_REGISTER_NAME::WHvX64RegisterRip;
-    reg_values[11].Reg64 = 0;
+    // Start the Instruction Pointer at 0
+    regs.rip = 0;
 
     // Create stack with stack base at high end of mapped payload
-    reg_names[12] = WHV_REGISTER_NAME::WHvX64RegisterRsp;
-    reg_values[12].Reg64 = payload_mem.get_size() as UINT64;
+    regs.rsp = payload_mem.get_size() as UINT64;
 
-    vp.set_registers(&reg_names, &reg_values).unwrap();
+    vcpu.set_regs(&regs).unwrap();
+
+    // Now overwrite the special registers we care about for setting up long mode
+    // cr3, cr4, cr0, Efer, Cs, Ds, Es, Fs, Gs, Ss
+    sregs.cr3 = pml4_addr;
+    sregs.cr4 = CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT;
+    sregs.cr0 = CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_WP | CR0_AM | CR0_PG;
+    sregs.efer = EFER_LME | EFER_LMA;
+    
+    // Set up a KM code segment that will be used for CS
+    let mut code_segment: SegmentRegister = Default::default();
+    code_segment.base = 0;
+    code_segment.limit = 0xffffffff;
+    code_segment.selector = 1 << 3;
+    code_segment.type_ = 11;
+    code_segment.present = 1;
+    code_segment.dpl = 0;
+    code_segment.db = 0;
+    code_segment.s = 0;
+    code_segment.l = 1;
+    code_segment.g = 1;
+    code_segment.avl = 0;
+    code_segment.unusable = 0;
+    code_segment.padding = 0;
+
+    // Set up a KM data segment that will be used for DS, ES, FS, GS, and SS
+    let mut data_segment: SegmentRegister = Default::default();
+    data_segment.base = 0;
+    data_segment.limit = 0xffffffff;
+    data_segment.selector = 2 << 3;
+    data_segment.type_ = 3;
+    data_segment.present = 1;
+    data_segment.dpl = 0;
+    data_segment.db = 0;
+    data_segment.s = 0;
+    data_segment.l = 1;
+    data_segment.g = 1;
+    data_segment.avl = 0;
+    data_segment.unusable = 0;
+    data_segment.padding = 0;
+
+    sregs.cs = code_segment;
+    sregs.ds = data_segment;
+    sregs.es = data_segment;
+    sregs.fs = data_segment;
+    sregs.gs = data_segment;
+    sregs.ss = data_segment;
+
+    vcpu.set_sregs(&sregs).unwrap();
 }
 
 fn read_payload(mem_addr: &mut VirtualMemory) {
