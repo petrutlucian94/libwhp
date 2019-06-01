@@ -203,6 +203,7 @@ impl<T: EmulatorCallbacks> Emulator<T> {
                 &mut return_status,
             )
         })?;
+         
         Ok(return_status)
     }
 }

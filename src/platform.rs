@@ -109,9 +109,6 @@ impl Partition {
         property: *const VOID,
         size: UINT32,
     ) -> Result<(), WHPError> {
-        let handle = *self.partition.borrow().handle();
-        println!("HANDLE (set prop): {:?}", handle);
-
         check_result(unsafe {
             WHvSetPartitionProperty(
                 *self.partition.borrow_mut().handle(),
@@ -161,8 +158,6 @@ impl Partition {
     }
 
     pub fn create_virtual_processor(&self, index: UINT32) -> Result<VirtualProcessor, WHPError> {
-        let exit_context: WHV_RUN_VP_EXIT_CONTEXT = Default::default();
-
         check_result(unsafe {
             WHvCreateVirtualProcessor(*self.partition.borrow_mut().handle(), index, 0)
         })?;

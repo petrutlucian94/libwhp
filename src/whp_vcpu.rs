@@ -15,7 +15,6 @@
 
 use std::io;
 use std::cell::RefCell;
-use std::rc::Rc;
 pub use whp_vcpu_structs::*;
 pub use win_hv_platform_defs::*;
 pub use win_hv_emulation_defs::*;
@@ -29,11 +28,20 @@ use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
 use vmm_vcpu::x86_64::{FpuState, MsrEntries, SpecialRegisters, StandardRegisters,
                        LapicState, CpuId};
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum IoCallbackState {
+    NoIoOperation = 0,
+    IoGetAccessSize = 1,
+    IoSetData = 2,
+}
+
 pub struct WhpIoAccessData {
     io_data: [u8; 8],
     io_data_len: usize,
     port: u16,
     is_write: u8,
+    state: IoCallbackState,
 }
 
 impl Default for WhpIoAccessData {
@@ -47,6 +55,7 @@ pub struct WhpMmioAccessData {
     mmio_data_len: usize,
     gpa: u64,
     is_write: u8,
+    state: IoCallbackState,
 }
 
 impl Default for WhpMmioAccessData {
@@ -105,11 +114,25 @@ impl WhpVirtualProcessor {
         let io_port_access_ctx =
             unsafe { whp_context.last_exit_context.anon_union.IoPortAccess };
 
-        let _status = self
+        let status = self
             .emulator
             .try_io_emulation(whp_context, &vp_context, &io_port_access_ctx)?;
         
-        Ok(())
+        // The function returns S_OK in most methods of operation, but
+        // return_status will return extended error information. Success is
+        // considered either EmulationSuccessful, or a failure of
+        // IoPortCallbackFailed. The latter is required because the callback
+        // returns a non-success E_PENDING status for the first of the two
+        // stages of IO emulation.
+        match status.EmulationSuccessful() {
+            1 => Ok(()),
+            _ => {
+                match status.IoPortCallbackFailed() {
+                    1 => Ok(()),
+                    _ => Err(WHPError::new(status.AsUINT32 as INT32)),
+                }
+            }
+        }
     }
 
     pub fn handle_mmio_exit(&self, whp_context: &mut WhpContext) -> Result<(), WHPError> {
@@ -117,12 +140,26 @@ impl WhpVirtualProcessor {
         let mmio_access_ctx =
             unsafe {whp_context.last_exit_context.anon_union.MemoryAccess };
 
-        let _status = self
+        let status = self
             .emulator
             .try_mmio_emulation(whp_context, &vp_context, &mmio_access_ctx)
             .unwrap();
-        
-        Ok(())
+
+        // The function returns S_OK in most methods of operation, but
+        // return_status will return extended error information. Success is
+        // considered either EmulationSuccessful, or a failure of
+        // MemoryCallbackFailed. The latter is required because the callback
+        // returns a non-success E_PENDING status for the first of the two
+        // stages of IO emulation.
+        match status.EmulationSuccessful() {
+            1 => Ok(()),
+            _ => {
+                match status.MemoryCallbackFailed() {
+                    1 => Ok(()),
+                    _ => Err(WHPError::new(status.AsUINT32 as INT32)),
+                }
+            }
+        }
     }
 
     /// Use request_interrupt to inject the specified interrupt vector.
@@ -141,6 +178,42 @@ impl WhpVirtualProcessor {
         self.whp_context.borrow().vp.request_interrupt(&mut interrupt).unwrap();
 
         Ok(())
+    }
+
+    pub fn get_partition_counters(
+        &self,
+        partition_counter_set: WHV_PARTITION_COUNTER_SET,
+    ) -> Result<(WHV_PARTITION_COUNTERS), WHPError> {
+
+        return self.whp_context.borrow().vp.get_partition_counters(partition_counter_set);
+    }
+
+    pub fn get_processor_counters(
+        &self,
+        processor_counter_set: WHV_PROCESSOR_COUNTER_SET,
+    ) -> Result<WHV_PROCESSOR_COUNTERS, WHPError> {
+
+        return self.whp_context.borrow().vp.get_processor_counters(processor_counter_set);
+    }
+
+    pub fn get_xsave_state(&self) -> Result<(XsaveArea), WHPError> {
+        return self.whp_context.borrow().vp.get_xsave_state();
+    }
+
+    pub fn set_xsave_state(&self, xsave_area: XsaveArea) -> Result<(), WHPError> {
+        return self.whp_context.borrow().vp.set_xsave_state(xsave_area);
+    }
+
+    pub fn set_delivery_notifications(&self) {
+        const NUM_REGS: usize = 1;
+        let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS] = Default::default();
+        let mut reg_names: [WHV_REGISTER_NAME; NUM_REGS] = Default::default();
+
+        let mut notifications: WHV_X64_DELIVERABILITY_NOTIFICATIONS_REGISTER = Default::default();
+        notifications.set_InterruptNotification(1);
+        reg_values[0].DeliverabilityNotifications = notifications;
+        reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterDeliverabilityNotifications;
+        self.whp_context.borrow().vp.set_registers(&reg_names, &reg_values).unwrap();
     }
 
 }
@@ -467,13 +540,21 @@ impl Vcpu for WhpVirtualProcessor {
             // for read accesses of MMIO or IO Port operations.
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
                 if whp_context.mmio_access_data.is_write == 0 {
-                    self.handle_mmio_exit(&mut whp_context);
+                    whp_context.mmio_access_data.state = IoCallbackState::IoSetData;
+                    self.handle_mmio_exit(&mut whp_context).unwrap();
+
+                    // Explicitly clear the data
+                    whp_context.mmio_access_data = Default::default();
                 }
             }
 
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
                 if whp_context.io_access_data.is_write == 0 {
-                    self.handle_io_port_exit(&mut whp_context);
+                    whp_context.io_access_data.state = IoCallbackState::IoSetData;
+                    self.handle_io_port_exit(&mut whp_context).unwrap();
+
+                    // Explicitly clear the data 
+                    whp_context.io_access_data = Default::default();
                 }
             }
             _ => {}
@@ -496,15 +577,41 @@ impl Vcpu for WhpVirtualProcessor {
         // the read data requested by the previous run
 
         whp_context.last_exit_context = whp_context.vp.run().unwrap();
+        if whp_context.last_exit_context.ExitReason !=
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess {
+        }
 
         let exit_reason = 
             match whp_context.last_exit_context.ExitReason {
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::Unknown,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
-                    VcpuExit::MemoryAccess
+                    whp_context.mmio_access_data.state = IoCallbackState::IoGetAccessSize;
+                    self.handle_mmio_exit(&mut whp_context).unwrap();
+
+                    let mmio_data_ptr = whp_context.mmio_access_data.mmio_data.as_mut_ptr();
+                    let size = whp_context.mmio_access_data.mmio_data_len;
+                    let mut mmio_data: &mut [u8];
+
+                    unsafe {
+                        mmio_data = std::slice::from_raw_parts_mut( mmio_data_ptr, size);
+                    }
+
+                    if whp_context.mmio_access_data.is_write == 0 {
+                        return Ok(VcpuExit::MmioRead(
+                            whp_context.mmio_access_data.gpa,
+                            mmio_data,
+                        ));
+                    }
+                    else {
+                        return Ok(VcpuExit::MmioWrite(
+                            whp_context.mmio_access_data.gpa,
+                            mmio_data,
+                        ));
+                    }
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
-                    self.handle_io_port_exit(&mut whp_context);
+                    whp_context.io_access_data.state = IoCallbackState::IoGetAccessSize;
+                    self.handle_io_port_exit(&mut whp_context).unwrap();
                     let io_data_ptr = whp_context.io_access_data.io_data.as_mut_ptr();
 
                     let size = whp_context.io_access_data.io_data_len;
@@ -512,7 +619,7 @@ impl Vcpu for WhpVirtualProcessor {
                     let mut io_data: &mut [u8];
 
                     unsafe {
-                        io_data = std::slice::from_raw_parts_mut( io_data_ptr, size);
+                        io_data = std::slice::from_raw_parts_mut(io_data_ptr, size);
                     }
 
                     if whp_context.io_access_data.is_write == 0 {
@@ -540,13 +647,24 @@ impl Vcpu for WhpVirtualProcessor {
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64InterruptWindow => {
                     VcpuExit::IrqWindowOpen
                 }
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => VcpuExit::Hlt,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => VcpuExit::IoapicEoi,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => VcpuExit::MsrAccess,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => VcpuExit::CpuId,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonException => VcpuExit::Exception,
-                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonCanceled => VcpuExit::Canceled,
-                _ => VcpuExit::Unknown,
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => {
+                    VcpuExit::Hlt
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => {
+                    VcpuExit::IoapicEoi
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => {
+                    VcpuExit::MsrAccess
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => {
+                    VcpuExit::CpuId
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonException => {
+                    VcpuExit::Exception
+                }
+                WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonCanceled => {
+                    VcpuExit::Canceled
+                }
             };
 
         Ok(exit_reason)
@@ -582,6 +700,8 @@ impl EmulatorCallbacks for WhpContext {
         let src: *const u8;
         let dst: *mut u8;
 
+        let ret_val: HRESULT;
+
         // Copy the port and data to the WhpIoAccessData in the WHP context
         // so that the calling VMM knows what to read/write
         self.io_access_data.port = io_access.Port;
@@ -592,23 +712,50 @@ impl EmulatorCallbacks for WhpContext {
             // Manually copy the data itself.
             src = &io_access.Data as *const _ as *const u8;
             dst = self.io_access_data.io_data.as_mut_ptr();
+
+            // Safe because the API guarantees that the Data stored in the IO access
+            // has size AccessSize in bytes and we've already checked that the size
+            // is less that the size of our destination buffer
+            unsafe {
+                std::ptr::copy_nonoverlapping(src, dst, size_bytes);
+            }
+            
+            ret_val = S_OK;
         }
         else {
-            // The calling VMM has performed the read, supply that data to the 
-            // WHV_EMULATOR_IO_ACCESS_INFO Data to complete the read for the 
-            // guest
-            src = self.io_access_data.io_data.as_ptr();
-            dst = &mut io_access.Data as *mut _ as *mut u8;
+            match self.io_access_data.state {
+                IoCallbackState::IoGetAccessSize => {
+                    // We've gotten and stored the access size; return a pending
+                    // value so that the hypervisor doesn't complete the emulation
+                    // yet
+                    ret_val = E_PENDING;
+                },
+                IoCallbackState::IoSetData => {
+                    // The calling VMM has performed the read, supply that data to the 
+                    // WHV_EMULATOR_IO_ACCESS_INFO Data to complete the read for the 
+                    // guest
+                    src = self.io_access_data.io_data.as_ptr();
+                    dst = &mut io_access.Data as *mut _ as *mut u8;
+
+                    // Safe because the API guarantees that the Data stored in the IO access
+                    // has size AccessSize in bytes and we've already checked that the size
+                    // is less that the size of our destination buffer
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src, dst, size_bytes);
+                    }
+
+                    // We will return S_OK so that the hypervisor will complete
+                    // the IO operation
+                    ret_val = S_OK;
+                },
+                _ => {
+                    assert!(false, "Invalid IO Emulator state");
+                    ret_val = E_FAIL;
+                }
+            }
         }
 
-        // Safe because the API guarantees that the Data stored in the IO access
-        // has size AccessSize in bytes and we've already checked that the size
-        // is less that the size of our destination buffer
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, dst, size_bytes);
-        }
-
-        S_OK
+        ret_val
     }
 
     fn memory(
@@ -616,15 +763,14 @@ impl EmulatorCallbacks for WhpContext {
         memory_access: &mut WHV_EMULATOR_MEMORY_ACCESS_INFO,
     ) -> HRESULT {
 
+        let mut ret_val: HRESULT = S_OK;
+
         assert!((memory_access.AccessSize > 0) &&
                 (memory_access.AccessSize <= 8));
 
         let is_write = memory_access.Direction;
         let size_bytes = memory_access.AccessSize as usize;
     
-        let src: *const u8;
-        let dst: *mut u8;
-
         // Copy the guest physical address and data to the WhpMmioAccessData
         // in the WHP context so that the calling VMM knows what to read/write
         self.mmio_access_data.gpa = memory_access.GpaAddress;
@@ -632,25 +778,32 @@ impl EmulatorCallbacks for WhpContext {
         self.mmio_access_data.is_write = is_write;
 
         if is_write == 1 {
-            src = &memory_access.Data as *const _ as *const u8;
-            dst = self.mmio_access_data.mmio_data.as_mut_ptr();
+            // Write the data to our local storage
+            self.mmio_access_data.mmio_data = memory_access.Data;
         }
         else {
-            // The calling VMM has performed the read; supply that data to the
-            // WHV_EMULATOR_MEMORY_ACCESS_INFO Data to complete the read for the
-            // guest
-            src = self.mmio_access_data.mmio_data.as_ptr();
-            dst = &mut memory_access.Data as *mut _ as *mut u8;
+            match self.mmio_access_data.state {
+                IoCallbackState::IoGetAccessSize => {
+                    // We've gotten and stored the access size; return a pending
+                    // value so that the hypervisor doesn't complete the emulation
+                    // yet
+                    ret_val = E_PENDING;
+                },
+                IoCallbackState::IoSetData => {
+                    // The calling VMM has performed the read; supply that data to the
+                    // WHV_EMULATOR_MEMORY_ACCESS_INFO Data to complete the read for the
+                    // guest
+                    memory_access.Data = self.mmio_access_data.mmio_data;
+
+                    // We will return S_OK so that the hypervisor will complete
+                    // the IO operation
+                    ret_val = S_OK;
+                },
+                _ => assert!(false, "Invalid IO Emulator state")
+            }
         }
 
-        // Safe because the API guarantees that the Data stored in the IO access
-        // has size AccessSize in bytes and we've already checked that the size
-        // is less that the size of our destination buffer
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, dst, size_bytes);
-        }
-
-        S_OK
+        ret_val
     }
 
     fn get_virtual_processor_registers(

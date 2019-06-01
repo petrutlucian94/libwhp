@@ -23,22 +23,19 @@ extern crate libc;
 extern crate libwhp;
 extern crate vmm_vcpu;
 
-use libwhp::instruction_emulator::*;
-use libwhp::memory::*;
-use libwhp::whp_vcpu::*;
-use libwhp::*;
-
-use vmm_vcpu::vcpu::Vcpu;
-use vmm_vcpu::x86_64::{
-    StandardRegisters, SpecialRegisters, FpuState, MsrEntries, MsrEntry, 
-    CpuId, LapicState, CpuIdEntry2, SegmentRegister,
-};
-
-use std::cell::RefCell;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{self, Write};
 use std::path::PathBuf;
+
+use libwhp::memory::*;
+use libwhp::whp_vcpu::*;
+use libwhp::*;
+
+use vmm_vcpu::vcpu::{Vcpu, VcpuExit};
+use vmm_vcpu::x86_64::{
+    StandardRegisters, SpecialRegisters, SegmentRegister,
+};
 
 const CPUID_EXT_HYPERVISOR: UINT32 = 1 << 31;
 
@@ -70,6 +67,7 @@ struct CpuInfo {
 }
 
 fn main() {
+    println!("\n********** DEMO USING WHP VIRTUAL PROCESSOR **********\n");
     check_hypervisor();
 
     let mut p = Partition::new().unwrap();
@@ -107,41 +105,66 @@ fn main() {
         // Set the APIC base and send an interrupt to the VCPU
         set_apic_base(&mut vcpu);
         vcpu.interrupt(INT_VECTOR).unwrap();
-        //set_delivery_notifications(&mut vcpu.vp.borrow_mut());
+        set_delivery_notifications(&vcpu);
     }
 
-/*
     loop {
-        let exit_context = vcpu.run().unwrap();
+        let exit_reason = vcpu.run();
 
-        match exit_context.ExitReason {
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => {
-                println!("All done!");
-                break;
+        match exit_reason {
+            Ok(run) => match run {
+                VcpuExit::IoIn(port, data) => {
+                    handle_io_access_in(port, data);
+                }
+                VcpuExit::IoOut(port, data) => {
+                    handle_io_access_out(port, data);
+                }
+                VcpuExit::MmioRead(addr, data) => {
+                    handle_mmio_read(addr, data);
+                }
+                VcpuExit::MmioWrite(addr, data) => {
+                    handle_mmio_write(addr, data);
+                }
+                VcpuExit::Canceled => {
+                    println!("Canceled");
+                }
+                VcpuExit::CpuId => {
+                    handle_cpuid_exit(&vcpu);
+                }
+                VcpuExit::MsrAccess => {
+                    handle_msr_exit(&vcpu);
+                }
+                VcpuExit::IoapicEoi => {
+                    println!("Apic EOI");
+                }
+                VcpuExit::IrqWindowOpen => {
+                    println!("IRQ Windows open");
+                }
+                VcpuExit::Exception => {
+                    let exit_context = unsafe { *vcpu.get_run_context() };
+                    println!("Exit Reason: {:?}", exit_context.ExitReason);
+                    println!("Exception. Breaking");
+                    break;
+                }
+                VcpuExit::Hlt => {
+                    println!("All done!");
+                    break;
+                }
+                _ => {
+                    println!("Unknown/unaccounted for exit");
+                }
+            },
+            // The unwrap on raw_os_error can only fail if we have a logic
+            // error in our code in which case it is better to panic.
+            Err(ref e) => {
+                match e.raw_os_error().unwrap() {
+                    _ => {
+                        println!("Failure during vcpu run: {}", e);
+                        break;
+                    }
+                }
             }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonException => {
-                break;
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
-                //handle_mmio_exit(&mut e, &mut callbacks, &exit_context)
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess => {
-                handle_io_port_exit(&mut e, &mut callbacks, &exit_context)
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => {
-                handle_cpuid_exit(&mut vcpu.vp.borrow_mut(), &exit_context)
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => {
-                handle_msr_exit(&mut vcpu.vp.borrow_mut(), &exit_context)
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => {
-                println!("ApicEoi");
-            }
-            WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64InterruptWindow => {
-                println!("Interrupt window");
-            }
-            _ => panic!("Unexpected exit type: {:?}", exit_context.ExitReason),
-        };
+        }
 
         // With the APIC enabled, the hlt instruction will not completely halt
         // the processor; it'll just halt it until another interrupt is
@@ -151,20 +174,72 @@ fn main() {
         // etc), teriminate the VCPU execution loop when both interrupts we're
         // expecting have been received. Plus we get to exercise the new
         // counter APIs.
-        if all_interrupts_received(&vcpu.vp.borrow()) {
+        if all_interrupts_received(&vcpu) {
             println!("All interrupts received. All done!");
             break;
         }
     }
-    */
+}
+
+fn handle_io_access_out(port: u16, data: &[u8]) {
+    if port == 42 {
+        io::stdout().write(data).unwrap();
+    }
+    else {
+        println!("Unsupported IO port");
+    }
+}
+
+fn handle_io_access_in(port: u16, data: &mut [u8]) {
+    if port == 43 {
+        // Simulate doing the read by writing a value to the buffer, which
+        // the example will later "read"
+        data[0] = 99;
+    }
+}
+
+fn handle_mmio_read(gpa: u64, data: &mut [u8]) { 
+    let ptr = data as *mut _ as *mut u64;
+
+    match data.len() {
+        8 => {
+            unsafe {
+                *ptr = 0x21001;
+                println!("MMIO read: 0x{:x} at 0x{:x}", *ptr, gpa);
+            }
+        },
+        1 => {
+            unsafe {
+                *ptr = 88;
+                println!("MMIO read: 0x{:x} at 0x{:x}", *ptr, gpa);
+            }
+        },
+        _ => println!("Unsupported MMIO access size: {}", data.len()),
+    }
+}
+
+fn handle_mmio_write(gpa: u64, data: &[u8] ) {
+    let ptr = data as *const _ as *const u64;
+
+    match data.len() {
+        8 => {
+            let value = unsafe {*ptr};
+            println!("MMIO write: 0x{:x} at 0x{:x}", value, gpa);
+        },
+        1 => {
+            let value = unsafe {*ptr};
+            println!("MMIO write: 0x{:x} at 0x{:x}", value, gpa);
+        },
+        _ => println!("Unsupported MMIO access size: {}", data.len()),
+    }
 }
 
 /*
  * Terminate VCPU execution when two interrupts have been received by the guest:
  * one from the host, and one from the guest
  */
-fn all_interrupts_received(vp: &VirtualProcessor) -> bool {
-    let counters: WHV_PROCESSOR_COUNTERS = vp
+fn all_interrupts_received(vcpu: &WhpVirtualProcessor) -> bool {
+    let counters: WHV_PROCESSOR_COUNTERS = vcpu
         .get_processor_counters(WHV_PROCESSOR_COUNTER_SET::WHvProcessorCounterSetApic)
         .unwrap();
     let apic_counters = unsafe { counters.ApicCounters };
@@ -197,33 +272,18 @@ fn set_apic_base(vcpu: &mut WhpVirtualProcessor) {
     vcpu.set_sregs(&sregs).unwrap();
 }
 
-/*
-fn set_delivery_notifications(vp: &mut VirtualProcessor) {
-    const NUM_REGS: usize = 1;
-    let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS] = Default::default();
-    let mut reg_names: [WHV_REGISTER_NAME; NUM_REGS] = Default::default();
-
-    let mut notifications: WHV_X64_DELIVERABILITY_NOTIFICATIONS_REGISTER = Default::default();
-    notifications.set_InterruptNotification(1);
-    reg_values[0].DeliverabilityNotifications = notifications;
-    reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterDeliverabilityNotifications;
-    vp.set_registers(&reg_names, &reg_values).unwrap();
+fn set_delivery_notifications(vcpu: &WhpVirtualProcessor) {
+    vcpu.set_delivery_notifications();
 }
-*/
 
-fn handle_msr_exit(vp: &mut VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) {
+fn handle_msr_exit(vcpu: &WhpVirtualProcessor) {
+    let exit_context = unsafe { *vcpu.get_run_context() };
+
     let msr_access = unsafe { exit_context.anon_union.MsrAccess };
 
-    const NUM_REGS: UINT32 = 3;
-    let mut reg_names: [WHV_REGISTER_NAME; NUM_REGS as usize] = Default::default();
-    let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS as usize] = Default::default();
+    let mut regs: StandardRegisters = vcpu.get_regs().unwrap();
 
-    reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterRip;
-    reg_names[1] = WHV_REGISTER_NAME::WHvX64RegisterRax;
-    reg_names[2] = WHV_REGISTER_NAME::WHvX64RegisterRdx;
-
-    reg_values[0].Reg64 =
-        exit_context.VpContext.Rip + exit_context.VpContext.InstructionLength() as u64;
+    regs.rip = exit_context.VpContext.Rip + exit_context.VpContext.InstructionLength() as u64;
 
     match msr_access.MsrNumber {
         1 => {
@@ -232,11 +292,14 @@ fn handle_msr_exit(vp: &mut VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CON
                     "MSR write. Number: 0x{:x}, Rax: 0x{:x}, Rdx: 0x{:x}",
                     msr_access.MsrNumber, msr_access.Rax, msr_access.Rdx
                 );
-            } else {
+            }
+            else {
                 let rax = 0x2000;
                 let rdx = 0x2001;
-                reg_values[1].Reg64 = rax;
-                reg_values[2].Reg64 = rdx;
+
+                regs.rax = rax;
+                regs.rdx = rdx;
+
                 println!(
                     "MSR read. Number: 0x{:x}, Rax: 0x{:x}, Rdx: 0x{:x}",
                     msr_access.MsrNumber, rax, rdx
@@ -248,76 +311,31 @@ fn handle_msr_exit(vp: &mut VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CON
         }
     }
 
-    let mut num_regs_set = NUM_REGS as usize;
-    if msr_access.AccessInfo.IsWrite() == 1 {
-        num_regs_set = 1;
-    }
-
-    vp.set_registers(&reg_names[0..num_regs_set], &reg_values[0..num_regs_set])
-        .unwrap();
+    vcpu.set_regs(&regs).unwrap();
 }
 
-fn handle_cpuid_exit(vp: &mut VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) {
+fn handle_cpuid_exit(vcpu: &WhpVirtualProcessor) {
+    let exit_context = unsafe { *vcpu.get_run_context() };
+
     let cpuid_access = unsafe { exit_context.anon_union.CpuidAccess };
-    println!("Got CPUID leaf: {}", cpuid_access.Rax);
 
-    const NUM_REGS: UINT32 = 5;
-    let mut reg_names: [WHV_REGISTER_NAME; NUM_REGS as usize] = Default::default();
-    let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS as usize] = Default::default();
-
-    reg_names[0] = WHV_REGISTER_NAME::WHvX64RegisterRip;
-    reg_names[1] = WHV_REGISTER_NAME::WHvX64RegisterRax;
-    reg_names[2] = WHV_REGISTER_NAME::WHvX64RegisterRbx;
-    reg_names[3] = WHV_REGISTER_NAME::WHvX64RegisterRcx;
-    reg_names[4] = WHV_REGISTER_NAME::WHvX64RegisterRdx;
-
-    reg_values[0].Reg64 =
-        exit_context.VpContext.Rip + exit_context.VpContext.InstructionLength() as u64;
-    reg_values[1].Reg64 = cpuid_access.DefaultResultRax;
-    reg_values[2].Reg64 = cpuid_access.DefaultResultRbx;
-    reg_values[3].Reg64 = cpuid_access.DefaultResultRcx;
-    reg_values[4].Reg64 = cpuid_access.DefaultResultRdx;
+    let mut regs: StandardRegisters = vcpu.get_regs().unwrap();
+    regs.rip = exit_context.VpContext.Rip + exit_context.VpContext.InstructionLength() as u64;
+    regs.rax = cpuid_access.DefaultResultRax;
+    regs.rbx = cpuid_access.DefaultResultRbx;
+    regs.rcx = cpuid_access.DefaultResultRcx;
+    regs.rdx = cpuid_access.DefaultResultRdx;
 
     match cpuid_access.Rax {
         1 => {
-            reg_values[3].Reg64 = CPUID_EXT_HYPERVISOR as UINT64;
+            regs.rcx = CPUID_EXT_HYPERVISOR as UINT64;
         }
         _ => {
             println!("Unknown CPUID leaf: {}", cpuid_access.Rax);
         }
     }
 
-    vp.set_registers(&reg_names, &reg_values).unwrap();
-}
-
-fn handle_mmio_exit<T: EmulatorCallbacks>(
-    e: &mut Emulator<T>,
-    context: &mut T,
-    exit_context: &WHV_RUN_VP_EXIT_CONTEXT,
-) {
-    let mem_access_ctx = unsafe { &exit_context.anon_union.MemoryAccess };
-    let _status = e
-        .try_mmio_emulation(
-            context,
-            &exit_context.VpContext,
-            mem_access_ctx,
-        )
-        .unwrap();
-}
-
-fn handle_io_port_exit<T: EmulatorCallbacks>(
-    e: &mut Emulator<T>,
-    context: &mut T,
-    exit_context: &WHV_RUN_VP_EXIT_CONTEXT,
-) {
-    let io_port_access_ctx = unsafe { &exit_context.anon_union.IoPortAccess };
-    let _status = e
-        .try_io_emulation(
-            context,
-            &exit_context.VpContext,
-            io_port_access_ctx,
-        )
-        .unwrap();
+    vcpu.set_regs(&regs).unwrap();
 }
 
 fn setup_partition(p: &mut Partition, cpu_info: &mut CpuInfo, apic_present: bool) {
@@ -504,108 +522,5 @@ fn check_hypervisor() {
         get_capability(WHV_CAPABILITY_CODE::WHvCapabilityCodeHypervisorPresent).unwrap();
     if unsafe { capability.HypervisorPresent } == FALSE {
         panic!("Hypervisor not present");
-    }
-}
-
-struct SampleCallbacks<'a> {
-    vp_ref_cell: &'a RefCell<VirtualProcessor>,
-}
-
-impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
-    fn io_port(
-        &mut self,
-        io_access: &mut WHV_EMULATOR_IO_ACCESS_INFO,
-    ) -> HRESULT {
-        if io_access.Port == 42 {
-            let data = unsafe {
-                std::slice::from_raw_parts(
-                    &io_access.Data as *const _ as *const u8,
-                    io_access.AccessSize as usize,
-                )
-            };
-            io::stdout().write(data).unwrap();
-        } else {
-            println!("Unsupported IO port");
-        }
-        S_OK
-    }
-
-    fn memory(
-        &mut self,
-        memory_access: &mut WHV_EMULATOR_MEMORY_ACCESS_INFO,
-    ) -> HRESULT {
-        let addr = memory_access.GpaAddress;
-        match memory_access.AccessSize {
-            8 => match memory_access.Direction {
-                0 => {
-                    let data = &memory_access.Data as *const _ as *mut u64;
-                    unsafe {
-                        *data = 0x1000;
-                        println!("MMIO read: 0x{:x} @0x{:x}", *data, addr);
-                    }
-                }
-                _ => {
-                    let value = unsafe { *(&memory_access.Data as *const _ as *const u64) };
-                    println!("MMIO write: 0x{:x} @0x{:x}", value, addr);
-                }
-            },
-            4 => match memory_access.Direction {
-                0 => {
-                    let data = &memory_access.Data as *const _ as *mut u32;
-                    unsafe {
-                        *data = 0x1000;
-                        println!("MMIO read: 0x{:x} @0x{:x}", *data, addr);
-                    }
-                }
-                _ => {
-                    let value = unsafe { *(&memory_access.Data as *const _ as *const u32) };
-                    println!("MMIO write: 0x{:x} @0x{:x}", value, addr);
-                }
-            },
-            _ => println!("Unsupported MMIO access size: {}", memory_access.AccessSize),
-        }
-
-        S_OK
-    }
-
-    fn get_virtual_processor_registers(
-        &mut self,
-        register_names: &[WHV_REGISTER_NAME],
-        register_values: &mut [WHV_REGISTER_VALUE],
-    ) -> HRESULT {
-        self.vp_ref_cell
-            .borrow()
-            .get_registers(register_names, register_values)
-            .unwrap();
-        S_OK
-    }
-
-    fn set_virtual_processor_registers(
-        &mut self,
-        register_names: &[WHV_REGISTER_NAME],
-        register_values: &[WHV_REGISTER_VALUE],
-    ) -> HRESULT {
-        self.vp_ref_cell
-            .borrow_mut()
-            .set_registers(register_names, register_values)
-            .unwrap();
-        S_OK
-    }
-
-    fn translate_gva_page(
-        &mut self,
-        gva: WHV_GUEST_VIRTUAL_ADDRESS,
-        translate_flags: WHV_TRANSLATE_GVA_FLAGS,
-        translation_result: &mut WHV_TRANSLATE_GVA_RESULT_CODE,
-        gpa: &mut WHV_GUEST_PHYSICAL_ADDRESS,
-    ) -> HRESULT {
-        let (translation_result1, gpa1) = self
-            .vp_ref_cell
-            .borrow()
-            .translate_gva(gva, translate_flags)
-            .unwrap();
-        *translation_result = translation_result1.ResultCode;
-        *gpa = gpa1;
-        S_OK
     }
 }

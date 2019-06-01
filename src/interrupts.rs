@@ -22,7 +22,7 @@ use std::io::Cursor;
 use std::mem;
 use std::result;
 
-use vmm_vcpu::vcpu::{Vcpu, LapicState};
+use vmm_vcpu::vcpu::LapicState;
 use platform::VirtualProcessor;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};

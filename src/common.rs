@@ -38,6 +38,7 @@ pub const S_OK: HRESULT = 0;
 pub const E_FAIL: HRESULT = -2147467259; // 0x80004005;
 pub const ERROR_HV_NOT_PRESENT: HRESULT = -1070264320; // 0xC0351000
 pub const E_INVALIDARG: HRESULT = -2147024809; // 0x80070057
+pub const E_PENDING: HRESULT =  0x8000000;
 
 #[derive(Debug)]
 pub struct WHPError {
