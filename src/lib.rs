@@ -20,6 +20,7 @@ extern crate vmm_vcpu;
 mod macros;
 
 mod common;
+pub mod debug;
 pub mod x86_64;
 pub mod instruction_emulator;
 pub mod interrupts;
@@ -32,7 +33,6 @@ mod win_hv_platform_defs;
 mod win_hv_platform_defs_internal;
 mod win_memory;
 mod whp_vcpu_structs;
-pub mod debug;
 
 pub use common::*;
 pub use platform::*;

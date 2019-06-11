@@ -22,6 +22,7 @@ pub use win_hv_platform_defs_internal::*;
 pub use x86_64::XsaveArea;
 pub use common::*;
 
+use debug;
 use platform::{VirtualProcessor, Partition};
 use instruction_emulator::{Emulator, EmulatorCallbacks};
 use vmm_vcpu::vcpu::{Vcpu, VcpuExit, Result as VcpuResult};
@@ -539,6 +540,7 @@ impl Vcpu for WhpVirtualProcessor {
     fn run(&self) -> VcpuResult<VcpuExit> {
 
         let mut whp_context = self.whp_context.borrow_mut();
+        println!("vcpu exit: {:?}", whp_context.last_exit_context.ExitReason);
 
         // In the case of MMIO and IO Port reads, we do not actually fill in the
         // data within the appropriate callbacks, as would normally be done. We
@@ -598,7 +600,7 @@ impl Vcpu for WhpVirtualProcessor {
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64IoPortAccess {
         }
 
-        let exit_reason = 
+        let exit_reason =
             match whp_context.last_exit_context.ExitReason {
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonNone => VcpuExit::Unknown,
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonMemoryAccess => {
@@ -653,9 +655,17 @@ impl Vcpu for WhpVirtualProcessor {
                     }
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnrecoverableException => {
+                    debug::dump_cpu_counters(&whp_context.vp);
+                    debug::dump_vp_regs(&whp_context.vp);
+                    debug::dump_run_context(&whp_context.last_exit_context);
+
                     VcpuExit::Exception
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonInvalidVpRegisterValue => {
+                    debug::dump_cpu_counters(&whp_context.vp);
+                    debug::dump_vp_regs(&whp_context.vp);
+                    debug::dump_run_context(&whp_context.last_exit_context);
+
                     VcpuExit::FailEntry
                 }
                 WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonUnsupportedFeature => {

@@ -5,8 +5,8 @@ pub use win_hv_platform_defs_internal::*;
 pub fn dump_run_context(run_context: &WHV_RUN_VP_EXIT_CONTEXT) {
     println!("ExitReason: {:?}", run_context.ExitReason);
     println!("Reserved = {}", run_context.Reserved);
-    println!("Run context: {:?}", run_context.VpContext);
-    println!("Execution state: {}", run_context.VpContext.ExecutionState);
+    println!("Run context: {:#?}", run_context.VpContext);
+    println!("Execution state: {:#?}", run_context.VpContext.ExecutionState);
 
     unsafe {
         match run_context.ExitReason {
@@ -38,7 +38,7 @@ pub fn dump_run_context(run_context: &WHV_RUN_VP_EXIT_CONTEXT) {
                 dump_apic_eoi_context(&run_context.anon_union.ApicEoi);
             }
             _ => {
-                println!("unexected exit reason!");
+                panic!("unexected exit reason!");
             }
         }
     }
