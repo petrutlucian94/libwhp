@@ -16,8 +16,7 @@
 use common::*;
 use memory::*;
 use std;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 use win_hv_platform::*;
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
@@ -44,9 +43,13 @@ pub struct PartitionHandle {
     handle: WHV_PARTITION_HANDLE,
 }
 
+// Handles can be safely shared among threads.
+unsafe impl Send for PartitionHandle {}
+unsafe impl Sync for PartitionHandle {}
+
 impl PartitionHandle {
-    fn handle(&self) -> &WHV_PARTITION_HANDLE {
-        &self.handle
+    fn handle(&self) -> WHV_PARTITION_HANDLE {
+        self.handle
     }
 }
 
@@ -57,7 +60,15 @@ impl Drop for PartitionHandle {
 }
 
 pub struct Partition {
-    partition: Rc<RefCell<PartitionHandle>>,
+    partition: Arc<PartitionHandle>,
+}
+
+impl Clone for Partition {
+    fn clone(&self) -> Partition {
+        Partition {
+            partition: self.partition.clone()
+        }
+    }
 }
 
 impl Partition {
@@ -65,12 +76,12 @@ impl Partition {
         let mut handle: WHV_PARTITION_HANDLE = std::ptr::null_mut();
         check_result(unsafe { WHvCreatePartition(&mut handle) })?;
         Ok(Partition {
-            partition: Rc::new(RefCell::new(PartitionHandle { handle: handle })),
+            partition: Arc::new(PartitionHandle { handle: handle }),
         })
     }
 
     pub fn set_property(
-        &mut self,
+        &self,
         property_code: WHV_PARTITION_PROPERTY_CODE,
         property: &WHV_PARTITION_PROPERTY,
     ) -> Result<(), WHPError> {
@@ -82,7 +93,7 @@ impl Partition {
         Ok(())
     }
 
-    pub fn set_property_cpuid_exits(&mut self, cpuids: &[UINT32]) -> Result<(), WHPError> {
+    pub fn set_property_cpuid_exits(&self, cpuids: &[UINT32]) -> Result<(), WHPError> {
         self.set_property_from_buffer(
             WHV_PARTITION_PROPERTY_CODE::WHvPartitionPropertyCodeCpuidExitList,
             cpuids.as_ptr() as *const VOID,
@@ -92,7 +103,7 @@ impl Partition {
     }
 
     pub fn set_property_cpuid_results(
-        &mut self,
+        &self,
         cpuid_results: &[WHV_X64_CPUID_RESULT],
     ) -> Result<(), WHPError> {
         self.set_property_from_buffer(
@@ -104,14 +115,14 @@ impl Partition {
     }
 
     fn set_property_from_buffer(
-        &mut self,
+        &self,
         property_code: WHV_PARTITION_PROPERTY_CODE,
         property: *const VOID,
         size: UINT32,
     ) -> Result<(), WHPError> {
         check_result(unsafe {
             WHvSetPartitionProperty(
-                *self.partition.borrow_mut().handle(),
+                self.partition.handle(),
                 property_code,
                 property,
                 size,
@@ -142,7 +153,7 @@ impl Partition {
         let mut written_size: UINT32 = 0;
         check_result(unsafe {
             WHvGetPartitionProperty(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 property_code,
                 property,
                 size,
@@ -152,23 +163,23 @@ impl Partition {
         Ok(written_size)
     }
 
-    pub fn setup(&mut self) -> Result<(), WHPError> {
-        check_result(unsafe { WHvSetupPartition(*self.partition.borrow_mut().handle()) })?;
+    pub fn setup(&self) -> Result<(), WHPError> {
+        check_result(unsafe { WHvSetupPartition(self.partition.handle()) })?;
         Ok(())
     }
 
     pub fn create_virtual_processor(&self, index: UINT32) -> Result<VirtualProcessor, WHPError> {
         check_result(unsafe {
-            WHvCreateVirtualProcessor(*self.partition.borrow_mut().handle(), index, 0)
+            WHvCreateVirtualProcessor(self.partition.handle(), index, 0)
         })?;
         Ok(VirtualProcessor {
-            partition: Rc::clone(&self.partition),
+            partition: Arc::clone(&self.partition),
             index: index,
         })
     }
 
     pub fn map_gpa_range<T: Memory>(
-        &mut self,
+        &self,
         source_address: &T,
         guest_address: WHV_GUEST_PHYSICAL_ADDRESS,
         size: UINT64,
@@ -176,7 +187,7 @@ impl Partition {
     ) -> Result<GPARangeMapping, WHPError> {
         check_result(unsafe {
             WHvMapGpaRange(
-                *self.partition.borrow_mut().handle(),
+                self.partition.handle(),
                 source_address.as_ptr(),
                 guest_address,
                 size,
@@ -184,7 +195,7 @@ impl Partition {
             )
         })?;
         Ok(GPARangeMapping {
-            partition: Rc::clone(&self.partition),
+            partition: Arc::clone(&self.partition),
             source_address: source_address.as_ptr(),
             guest_address: guest_address,
             size: size,
@@ -195,7 +206,7 @@ impl Partition {
     pub fn request_interrupt(&self, interrupt: &WHV_INTERRUPT_CONTROL) -> Result<(), WHPError> {
         check_result(unsafe {
             WHvRequestInterrupt(
-                *self.partition.borrow_mut().handle(),
+                self.partition.handle(),
                 interrupt,
                 std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as UINT32,
             )
@@ -205,7 +216,7 @@ impl Partition {
 }
 
 pub struct GPARangeMapping {
-    partition: Rc<RefCell<PartitionHandle>>,
+    partition: Arc<PartitionHandle>,
     source_address: *const VOID,
     guest_address: WHV_GUEST_PHYSICAL_ADDRESS,
     size: UINT64,
@@ -232,14 +243,14 @@ impl GPARangeMapping {
 
 impl Drop for GPARangeMapping {
     fn drop(&mut self) {
-        let p = self.partition.borrow_mut();
-        check_result(unsafe { WHvUnmapGpaRange(*p.handle(), self.guest_address, self.size) })
+        let p = &self.partition;
+        check_result(unsafe { WHvUnmapGpaRange(p.handle(), self.guest_address, self.size) })
             .unwrap();
     }
 }
 
 pub struct VirtualProcessor {
-    partition: Rc<RefCell<PartitionHandle>>,
+    partition: Arc<PartitionHandle>,
     index: UINT32,
 }
 
@@ -254,7 +265,7 @@ impl VirtualProcessor {
 
         check_result(unsafe {
             WHvRunVirtualProcessor(
-                *self.partition.borrow_mut().handle(),
+                self.partition.handle(),
                 self.index,
                 &mut exit_context as *mut _ as *mut VOID,
                 exit_context_size,
@@ -264,9 +275,9 @@ impl VirtualProcessor {
         Ok(exit_context)
     }
 
-    pub fn cancel_run(&mut self) -> Result<(), WHPError> {
+    pub fn cancel_run(&self) -> Result<(), WHPError> {
         check_result(unsafe {
-            WHvCancelRunVirtualProcessor(*self.partition.borrow_mut().handle(), self.index, 0)
+            WHvCancelRunVirtualProcessor(self.partition.handle(), self.index, 0)
         })?;
         Ok(())
     }
@@ -284,7 +295,7 @@ impl VirtualProcessor {
 
         check_result(unsafe {
             WHvSetVirtualProcessorRegisters(
-                *self.partition.borrow_mut().handle(),
+                self.partition.handle(),
                 self.index,
                 reg_names.as_ptr(),
                 num_regs as UINT32,
@@ -307,7 +318,7 @@ impl VirtualProcessor {
 
         check_result(unsafe {
             WHvGetVirtualProcessorRegisters(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 self.index,
                 reg_names.as_ptr(),
                 num_regs as UINT32,
@@ -327,7 +338,7 @@ impl VirtualProcessor {
 
         check_result(unsafe {
             WHvTranslateGva(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 self.index,
                 gva,
                 flags,
@@ -349,7 +360,7 @@ impl VirtualProcessor {
 
         check_result(unsafe {
             WHvQueryGpaRangeDirtyBitmap(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 gva,
                 range_size_in_bytes,
                 bitmap.as_mut_ptr(),
@@ -365,7 +376,7 @@ impl VirtualProcessor {
 
         check_result(unsafe {
             WHvGetVirtualProcessorInterruptControllerState(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 self.index,
                 &mut state as *mut _ as *mut VOID,
                 std::mem::size_of::<LapicState>() as UINT32,
@@ -378,7 +389,7 @@ impl VirtualProcessor {
     pub fn set_lapic(&self, state: &LapicState) -> Result<(), WHPError> {
         check_result(unsafe {
             WHvSetVirtualProcessorInterruptControllerState(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 self.index,
                 state as *const _ as *const VOID,
                 std::mem::size_of::<LapicState>() as UINT32,
@@ -390,7 +401,7 @@ impl VirtualProcessor {
     pub fn request_interrupt(&self, interrupt: &WHV_INTERRUPT_CONTROL) -> Result<(), WHPError> {
         check_result(unsafe {
             WHvRequestInterrupt(
-                *self.partition.borrow_mut().handle(),
+                self.partition.handle(),
                 interrupt,
                 std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as UINT32,
             )
@@ -415,7 +426,7 @@ impl VirtualProcessor {
 
         check_result(unsafe {
             WHvGetPartitionCounters(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 partition_counter_set,
                 &mut partition_counters as *mut _ as *mut VOID,
                 buffer_size_in_bytes as UINT32,
@@ -451,7 +462,7 @@ impl VirtualProcessor {
 
         check_result(unsafe {
             WHvGetVirtualProcessorCounters(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 self.index,
                 processor_counter_set,
                 &mut processor_counters as *mut _ as *mut VOID,
@@ -468,7 +479,7 @@ impl VirtualProcessor {
 
         check_result(unsafe {
             WHvGetVirtualProcessorXsaveState(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 self.index,
                 &mut xsave_area as *mut _ as *mut VOID,
                 std::mem::size_of::<XsaveArea>() as UINT32,
@@ -481,7 +492,7 @@ impl VirtualProcessor {
     pub fn set_xsave_state(&self, xsave_area: XsaveArea) -> Result<(), WHPError> {
         check_result(unsafe {
             WHvSetVirtualProcessorXsaveState(
-                *self.partition.borrow().handle(),
+                self.partition.handle(),
                 self.index,
                 &xsave_area as *const _ as *const VOID,
                 std::mem::size_of::<XsaveArea>() as UINT32,
@@ -494,7 +505,7 @@ impl VirtualProcessor {
 impl Drop for VirtualProcessor {
     fn drop(&mut self) {
         check_result(unsafe {
-            WHvDeleteVirtualProcessor(*self.partition.borrow_mut().handle(), self.index)
+            WHvDeleteVirtualProcessor(self.partition.handle(), self.index)
         })
         .unwrap();
     }
@@ -517,9 +528,9 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             // Create an invalid partition
             let _p = Partition {
-                partition: Rc::new(RefCell::new(PartitionHandle {
+                partition: Arc::new(PartitionHandle {
                     handle: std::ptr::null_mut(),
-                })),
+                }),
             };
         });
         assert!(result.is_err(), "Drop was suppoesed to panic");
