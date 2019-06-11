@@ -17,7 +17,7 @@ use common::*;
 use memory::*;
 use std;
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 use win_hv_platform::*;
 pub use win_hv_platform_defs::*;
 pub use win_hv_platform_defs_internal::*;
@@ -44,6 +44,10 @@ pub struct PartitionHandle {
     handle: WHV_PARTITION_HANDLE,
 }
 
+// Handles can be safely shared among threads.
+unsafe impl Send for PartitionHandle {}
+unsafe impl Sync for PartitionHandle {}
+
 impl PartitionHandle {
     fn handle(&self) -> &WHV_PARTITION_HANDLE {
         &self.handle
@@ -57,7 +61,18 @@ impl Drop for PartitionHandle {
 }
 
 pub struct Partition {
-    partition: Rc<RefCell<PartitionHandle>>,
+    partition: Arc<RefCell<PartitionHandle>>,
+}
+
+unsafe impl Send for Partition {}
+unsafe impl Sync for Partition {}
+
+impl Clone for Partition {
+    fn clone(&self) -> Partition {
+        Partition {
+            partition: self.partition.clone()
+        }
+    }
 }
 
 impl Partition {
@@ -65,7 +80,7 @@ impl Partition {
         let mut handle: WHV_PARTITION_HANDLE = std::ptr::null_mut();
         check_result(unsafe { WHvCreatePartition(&mut handle) })?;
         Ok(Partition {
-            partition: Rc::new(RefCell::new(PartitionHandle { handle: handle })),
+            partition: Arc::new(RefCell::new(PartitionHandle { handle: handle })),
         })
     }
 
@@ -162,7 +177,7 @@ impl Partition {
             WHvCreateVirtualProcessor(*self.partition.borrow_mut().handle(), index, 0)
         })?;
         Ok(VirtualProcessor {
-            partition: Rc::clone(&self.partition),
+            partition: Arc::clone(&self.partition),
             index: index,
         })
     }
@@ -184,7 +199,7 @@ impl Partition {
             )
         })?;
         Ok(GPARangeMapping {
-            partition: Rc::clone(&self.partition),
+            partition: Arc::clone(&self.partition),
             source_address: source_address.as_ptr(),
             guest_address: guest_address,
             size: size,
@@ -205,7 +220,7 @@ impl Partition {
 }
 
 pub struct GPARangeMapping {
-    partition: Rc<RefCell<PartitionHandle>>,
+    partition: Arc<RefCell<PartitionHandle>>,
     source_address: *const VOID,
     guest_address: WHV_GUEST_PHYSICAL_ADDRESS,
     size: UINT64,
@@ -239,7 +254,7 @@ impl Drop for GPARangeMapping {
 }
 
 pub struct VirtualProcessor {
-    partition: Rc<RefCell<PartitionHandle>>,
+    partition: Arc<RefCell<PartitionHandle>>,
     index: UINT32,
 }
 
@@ -517,7 +532,7 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             // Create an invalid partition
             let _p = Partition {
-                partition: Rc::new(RefCell::new(PartitionHandle {
+                partition: Arc::new(RefCell::new(PartitionHandle {
                     handle: std::ptr::null_mut(),
                 })),
             };
