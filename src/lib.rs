@@ -32,6 +32,7 @@ mod win_hv_platform_defs;
 mod win_hv_platform_defs_internal;
 mod win_memory;
 mod whp_vcpu_structs;
+pub mod debug;
 
 pub use common::*;
 pub use platform::*;
