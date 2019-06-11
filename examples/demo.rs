@@ -89,23 +89,21 @@ fn main() {
     setup_long_mode(&mut vp, &payload_mem);
     read_payload(&mut payload_mem);
 
-    let vp_ref_cell = RefCell::new(vp);
-
     let mut callbacks = SampleCallbacks {
-        vp_ref_cell: &vp_ref_cell,
+        vp: &vp,
     };
 
     let mut e = Emulator::<SampleCallbacks>::new().unwrap();
 
     if cpu_info.apic_enabled {
         // Set the APIC base and send an interrupt to the VCPU
-        set_apic_base(&mut vp_ref_cell.borrow_mut());
-        send_ipi(&mut vp_ref_cell.borrow_mut(), INT_VECTOR);
-        set_delivery_notifications(&mut vp_ref_cell.borrow_mut());
+        set_apic_base(&vp);
+        send_ipi(&vp, INT_VECTOR);
+        set_delivery_notifications(&vp);
     }
 
     loop {
-        let exit_context = vp_ref_cell.borrow_mut().run().unwrap();
+        let exit_context = vp.run().unwrap();
 
         match exit_context.ExitReason {
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Halt => {
@@ -122,10 +120,10 @@ fn main() {
                 handle_io_port_exit(&mut e, &mut callbacks, &exit_context)
             }
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64Cpuid => {
-                handle_cpuid_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
+                handle_cpuid_exit(&vp, &exit_context)
             }
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64MsrAccess => {
-                handle_msr_exit(&mut vp_ref_cell.borrow_mut(), &exit_context)
+                handle_msr_exit(&vp, &exit_context)
             }
             WHV_RUN_VP_EXIT_REASON::WHvRunVpExitReasonX64ApicEoi => {
                 println!("ApicEoi");
@@ -144,7 +142,7 @@ fn main() {
         // etc), teriminate the VCPU execution loop when both interrupts we're
         // expecting have been received. Plus we get to exercise the new
         // counter APIs.
-        if all_interrupts_received(&vp_ref_cell.borrow()) {
+        if all_interrupts_received(&vp) {
             println!("All interrupts received. All done!");
             break;
         }
@@ -168,7 +166,7 @@ fn all_interrupts_received(vp: &VirtualProcessor) -> bool {
     }
 }
 
-fn set_apic_base(vp: &mut VirtualProcessor) {
+fn set_apic_base(vp: &VirtualProcessor) {
     // Page table translations for this guest only cover the first 1GB of memory,
     // and the default APIC base falls above that. Set the APIC base to
     // something lower, within our range of virtual memory
@@ -195,7 +193,7 @@ fn set_apic_base(vp: &mut VirtualProcessor) {
     vp.set_registers(&reg_names, &reg_values).unwrap();
 }
 
-fn send_msi(vp: &mut VirtualProcessor, message: &WHV_MSI_ENTRY) {
+fn send_msi(vp: &VirtualProcessor, message: &WHV_MSI_ENTRY) {
     let addr: UINT32 = unsafe { message.anon_struct.Address };
     let data: UINT32 = unsafe { message.anon_struct.Data };
 
@@ -227,7 +225,7 @@ fn send_msi(vp: &mut VirtualProcessor, message: &WHV_MSI_ENTRY) {
     vp.request_interrupt(&mut interrupt).unwrap();
 }
 
-fn send_ipi(vp: &mut VirtualProcessor, vector: u32) {
+fn send_ipi(vp: &VirtualProcessor, vector: u32) {
     println!("Send IPI from the host to the guest");
 
     let mut message: WHV_MSI_ENTRY = Default::default();
@@ -247,7 +245,7 @@ fn send_ipi(vp: &mut VirtualProcessor, vector: u32) {
     send_msi(vp, &message);
 }
 
-fn set_delivery_notifications(vp: &mut VirtualProcessor) {
+fn set_delivery_notifications(vp: &VirtualProcessor) {
     const NUM_REGS: usize = 1;
     let mut reg_values: [WHV_REGISTER_VALUE; NUM_REGS] = Default::default();
     let mut reg_names: [WHV_REGISTER_NAME; NUM_REGS] = Default::default();
@@ -259,7 +257,7 @@ fn set_delivery_notifications(vp: &mut VirtualProcessor) {
     vp.set_registers(&reg_names, &reg_values).unwrap();
 }
 
-fn handle_msr_exit(vp: &mut VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) {
+fn handle_msr_exit(vp: &VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) {
     let msr_access = unsafe { exit_context.anon_union.MsrAccess };
 
     const NUM_REGS: UINT32 = 3;
@@ -305,7 +303,7 @@ fn handle_msr_exit(vp: &mut VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CON
         .unwrap();
 }
 
-fn handle_cpuid_exit(vp: &mut VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) {
+fn handle_cpuid_exit(vp: &VirtualProcessor, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) {
     let cpuid_access = unsafe { exit_context.anon_union.CpuidAccess };
     println!("Got CPUID leaf: {}", cpuid_access.Rax);
 
@@ -464,7 +462,7 @@ fn initialize_address_space(payload_mem: &VirtualMemory) -> u64 {
     pml4_addr
 }
 
-fn setup_long_mode(vp: &mut VirtualProcessor, payload_mem: &VirtualMemory) {
+fn setup_long_mode(vp: &VirtualProcessor, payload_mem: &VirtualMemory) {
     let pml4_addr = initialize_address_space(payload_mem);
 
     const NUM_REGS: UINT32 = 13;
@@ -556,7 +554,7 @@ fn check_hypervisor() {
 }
 
 struct SampleCallbacks<'a> {
-    vp_ref_cell: &'a RefCell<VirtualProcessor>,
+    vp: &'a VirtualProcessor<'a>,
 }
 
 impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
@@ -663,8 +661,7 @@ impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
         register_names: &[WHV_REGISTER_NAME],
         register_values: &mut [WHV_REGISTER_VALUE],
     ) -> HRESULT {
-        self.vp_ref_cell
-            .borrow()
+        self.vp
             .get_registers(register_names, register_values)
             .unwrap();
         S_OK
@@ -675,8 +672,7 @@ impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
         register_names: &[WHV_REGISTER_NAME],
         register_values: &[WHV_REGISTER_VALUE],
     ) -> HRESULT {
-        self.vp_ref_cell
-            .borrow_mut()
+        self.vp
             .set_registers(register_names, register_values)
             .unwrap();
         S_OK
@@ -690,8 +686,7 @@ impl<'a> EmulatorCallbacks for SampleCallbacks<'a> {
         gpa: &mut WHV_GUEST_PHYSICAL_ADDRESS,
     ) -> HRESULT {
         let (translation_result1, gpa1) = self
-            .vp_ref_cell
-            .borrow()
+            .vp
             .translate_gva(gva, translate_flags)
             .unwrap();
         *translation_result = translation_result1.ResultCode;
