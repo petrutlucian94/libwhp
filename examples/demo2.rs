@@ -471,7 +471,7 @@ fn setup_long_mode(vcpu: &mut WhpVirtualProcessor, payload_mem: &VirtualMemory) 
     code_segment.present = 1;
     code_segment.dpl = 0;
     code_segment.db = 0;
-    code_segment.s = 0;
+    code_segment.s = 1;
     code_segment.l = 1;
     code_segment.g = 1;
     code_segment.avl = 0;
@@ -487,7 +487,7 @@ fn setup_long_mode(vcpu: &mut WhpVirtualProcessor, payload_mem: &VirtualMemory) 
     data_segment.present = 1;
     data_segment.dpl = 0;
     data_segment.db = 0;
-    data_segment.s = 0;
+    data_segment.s = 1;
     data_segment.l = 1;
     data_segment.g = 1;
     data_segment.avl = 0;

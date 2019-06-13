@@ -406,7 +406,7 @@ impl ConvertSegmentRegister for WHV_X64_SEGMENT_REGISTER {
             present: self.Present() as u8,
             dpl: self.DescriptorPrivilegeLevel() as u8,
             db: self.Default() as u8,
-            s: !self.NonSystemSegment() as u8,
+            s: self.NonSystemSegment() as u8,
             l: self.Long() as u8,
             g: self.Granularity() as u8,
             avl: self.Available() as u8,
@@ -423,11 +423,15 @@ impl ConvertSegmentRegister for WHV_X64_SEGMENT_REGISTER {
             Attributes: 0,
         };
 
+
         segment.set_SegmentType(from.type_ as u16);
-        segment.set_NonSystemSegment(!from.s as u16);
         segment.set_Present(from.present as u16);
+        segment.set_DescriptorPrivilegeLevel(from.dpl as u16);
+        segment.set_Default(from.db as u16);
+        segment.set_NonSystemSegment(from.s as u16);
         segment.set_Long(from.l as u16);
         segment.set_Granularity(from.g as u16);
+        segment.set_Available(from.avl as u16);
 
         segment
     }
@@ -652,5 +656,37 @@ mod tests {
         let fpu_state_out = WinFpuRegisters::to_portable(&fregs);
 
         assert_eq!(fpu_state_in, fpu_state_out, "FP conversion failed");
+    }
+
+    #[test]
+    /// Convert a SegmentRegister to WHP format and back, making sure it
+    /// stays consistent.
+    fn test_convert_segment_reg() {
+        let sreg = SegmentRegister {
+            base: 0,
+            limit: 1048575,
+            selector: 8,
+            type_: 11,
+            present: 1,
+            dpl: 1,
+            db: 1,
+            s: 1,
+            l: 1,
+            g: 1,
+            avl: 1,
+            unusable: 0,
+            padding: 0
+        };
+
+        let whp_sreg = WHV_X64_SEGMENT_REGISTER::from_portable(&sreg);
+
+        println!("sreg db: {}", sreg.db);
+        println!("whp reg db {:?}", whp_sreg.Default());
+
+        println!("sreg s: {}", sreg.s);
+        println!("whp reg s {:?}", whp_sreg.NonSystemSegment());
+        let converted_sreg = whp_sreg.to_portable();
+
+        assert_eq!(sreg, converted_sreg);
     }
 }
