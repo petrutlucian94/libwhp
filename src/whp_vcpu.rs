@@ -71,6 +71,8 @@ pub struct WhpContext {
     mmio_access_data: WhpMmioAccessData,
 }
 
+unsafe impl Send for Emulator<WhpContext> {}
+
 impl WhpContext {
     fn get_run_context_ptr(&self) -> *const WHV_RUN_VP_EXIT_CONTEXT {
         &self.last_exit_context as *const WHV_RUN_VP_EXIT_CONTEXT
