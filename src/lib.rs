@@ -19,19 +19,17 @@ extern crate vmm_vcpu;
 #[macro_use]
 mod macros;
 
-mod common;
+pub mod common;
 pub mod x86_64;
 pub mod instruction_emulator;
 pub mod interrupts;
-pub mod whp_vcpu;
-mod platform;
+pub mod platform;
 mod win_hv_emulation;
 mod win_hv_emulation_defs;
 mod win_hv_platform;
 mod win_hv_platform_defs;
 mod win_hv_platform_defs_internal;
 mod win_memory;
-mod whp_vcpu_structs;
 pub mod debug;
 
 pub use common::*;

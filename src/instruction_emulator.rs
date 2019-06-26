@@ -57,6 +57,8 @@ pub struct Emulator<T: EmulatorCallbacks> {
     dummy: std::marker::PhantomData<T>,
 }
 
+unsafe impl<T: EmulatorCallbacks> Send for Emulator<T> {}
+
 impl<T: EmulatorCallbacks> Emulator<T> {
     pub fn new() -> Result<Self, WHPError> {
 
